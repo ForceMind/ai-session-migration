@@ -12,3 +12,10 @@ backups/
 *.recovery.key
 *.zip.enc
 .DS_Store
+*.asmkey
+*.asmb
+*.part
+*.dmg
+*.exe
+*.app/
+local-state.json

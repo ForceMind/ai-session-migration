@@ -1,0 +1,65 @@
+name: Desktop client
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'design/**', 'assets/screenshots/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONPATH: src
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: python -B -m unittest discover -s tests -p 'test_*.py' -v
+  windows-build:
+    runs-on: windows-latest
+    env:
+      PYTHONPATH: src
+      PYTHONUTF8: '1'
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements-build.txt
+      - run: python -B -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Build double-clickable Windows client
+        run: python tools/build_app.py --dist release --work build/windows
+      - name: Exercise packaged client using synthetic sources only
+        env:
+          ASM_ACCEPTANCE_TEST: '1'
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = 'tests'
+          python -c "from pathlib import Path; from fixtures import make_home; make_home(Path('build/smoke-home').resolve())"
+          $client = Join-Path $PWD 'release/AI Session Migration/AI Session Migration.exe'
+          $arguments = @('--smoke-home', (Join-Path $PWD 'build/smoke-home'), '--smoke-state', (Join-Path $PWD 'build/smoke-state'), '--smoke-report', (Join-Path $PWD 'build/packaged-smoke.json'))
+          $process = Start-Process -FilePath $client -ArgumentList ($arguments | ForEach-Object { '"' + $_ + '"' }) -PassThru -Wait
+          if ($process.ExitCode -ne 0) { throw "Packaged client failed: $($process.ExitCode)" }
+          $result = Get-Content build/packaged-smoke.json -Raw | ConvertFrom-Json
+          if (-not $result.ok) { throw 'Packaged client acceptance failed' }
+      - name: Upload standalone Windows client
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Session-Migration-0.1.0-Windows-x64
+          path: release/AI Session Migration/
+          retention-days: 14
+      - name: Upload synthetic acceptance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-synthetic-acceptance
+          path: build/packaged-smoke.json
+          retention-days: 14

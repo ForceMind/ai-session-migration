@@ -1,0 +1,28 @@
+AI Session Migration is licensed under MIT; see LICENSE.
+
+This desktop distribution bundles the following third-party components:
+
+Qt for Python / PySide6 Essentials and Shiboken6 6.12.0
+Copyright The Qt Company Ltd. and other contributors.
+Used under the GNU Lesser General Public License version 3 (LGPLv3).
+Qt licenses and component notices are distributed with the package metadata and
+Qt libraries. The Python application uses dynamically linked Qt libraries.
+Source and license information: https://code.qt.io/pyside/pyside-setup.git/
+https://www.qt.io/licensing/open-source-lgpl-obligations
+
+CPython 3.12: Python Software Foundation License and notices.
+https://www.python.org/psf/license/
+
+python-zstandard 0.25.0: BSD-3-Clause; Zstandard: BSD-3-Clause or GPLv2.
+https://github.com/indygreg/python-zstandard
+
+cryptography 50.0.2: Apache-2.0 or BSD-3-Clause; bundled OpenSSL uses Apache-2.0.
+https://github.com/pyca/cryptography
+
+PyInstaller 6.22.3 bootloader: GPL with the PyInstaller exception, allowing
+distribution of bundled applications under their own license.
+https://pyinstaller.org/en/stable/license.html
+
+See included dist-info license files for the full applicable license texts.
+This distribution is an independent community tool, not an official client of
+Anthropic, OpenAI or DeepSeek.
