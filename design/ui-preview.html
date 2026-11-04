@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Session Migration · UI 设计预览</title>
+  <link rel="stylesheet" href="ui.css">
+</head>
+<body>
+  <div class="desktop-window">
+    <header class="titlebar">
+      <div class="traffic" aria-hidden="true"><i></i><i></i><i></i></div>
+      <span class="window-title">AI Session Migration</span>
+      <span class="demo-label">UI 设计预览 · 示例数据</span>
+    </header>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="导航">
+        <div class="brand"><span class="brand-mark">↗</span><div><strong>会话迁移</strong><small>AI Session Migration</small></div></div>
+        <nav id="primary-nav"></nav>
+        <div class="nav-caption">来源 <span>3</span></div><nav id="source-nav"></nav>
+        <div class="nav-caption">项目 <span>4</span></div><nav id="project-nav"></nav>
+        <div class="sidebar-bottom"><button class="nav-item" data-route="sources"><span data-icon="sources"></span>来源管理</button><button class="nav-item" data-action="settings"><span data-icon="settings"></span>设置</button><div class="local-note"><i></i>本地优先 · 开源</div></div>
+      </aside>
+      <main id="main"></main>
+    </div>
+    <footer class="statusbar"><span><i></i>本地设计稿 · 未连接真实资料</span><span>Windows 导入与续聊 · 待目标电脑验证</span></footer>
+  </div>
+  <div class="preview-note">可点击侧栏、会话、附件和备份向导查看设计。所有内容与任务均为模拟，不会读取或修改本机资料。 <button class="btn quiet small" data-route="welcome">查看首次启动设计 →</button></div>
+  <div id="modal-root"></div><div id="toast" role="status" aria-live="polite"></div>
+  <script src="ui.js"></script>
+</body>
+</html>
