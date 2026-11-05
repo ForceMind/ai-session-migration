@@ -10,4 +10,6 @@ Cloudflare Pages 项目为 `ai-session-migration`，生产分支 `main`。仅上
 
 静态检查已检查锚点唯一性、内部链接、图片 alt、离线资源存在、外链域名、XML、JavaScript 语法、部署文件大小，以及部署目录不含私密资料类型。CSS 含桌面、平板、手机布局和减少动态效果规则。浏览器未验证，不将静态检查当作视觉或交互验收。
 
-当前：专用 Pages 项目已创建，等待首轮上传与独立线上回读。验收完成后在此更新实际部署与验证范围。
+已上线并独立回读：生产地址为 https://ai-session-migration.pages.dev/ ，部署 ID `24a903d4-367f-4648-83a1-f9e675d133bf`，部署版本地址为 https://24a903d4.ai-session-migration.pages.dev 。Cloudflare 返回 production / deploy success，网页资源对应提交 `3c4b0f7fdae52e32168cc00b7abf29224341aa58`；后续仅更新本发布记录，不改动上线资源。
+
+7 个公开资源（首页、CSS、JS、图标、robots、sitemap）已从生产地址实际获取，与本地字节和 SHA-256 一致。安全响应头实际生效。4 个公开下载入口已核验：两个安装包 HTTP 200 且 GitHub 服务端摘要/大小与本地一致；操作说明和 SHA-256 清单实际下载并逐字节核对。所有安装包摘要保持已验收版本不变。浏览器未验证。
