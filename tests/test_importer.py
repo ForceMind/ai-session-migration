@@ -2,6 +2,8 @@ import json
 from contextlib import closing
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -106,6 +108,31 @@ class ImportTest(unittest.TestCase):
             self.execute(fault=fail)
         self.assertEqual(raised.exception.report['status'], 'rolled-back')
         self.assertTrue(Path(raised.exception.report['backup']).is_file())
+        self.assert_original_targets()
+
+    def test_abrupt_process_exit_is_recoverable_from_persisted_journal(self):
+        plan = self.plan()
+        path = self.base / 'synthetic-plan.json'
+        path.write_text(json.dumps(plan.to_dict()), encoding='utf-8')
+        script = '''
+import json,os,sys
+from pathlib import Path
+from ai_session_migration.importer import ImportPlan,execute_import
+base=Path(sys.argv[1])
+plan=ImportPlan(**json.loads((base/'synthetic-plan.json').read_text(encoding='utf-8')))
+def crash(stage):
+    if stage=='before-publish-codex':os._exit(23)
+execute_import(plan,base/'crash-backups',base/'cache',confirmed_offline=True,fault=crash)
+'''
+        child = subprocess.run([sys.executable, '-B', '-c', script, str(self.base)], capture_output=True, timeout=30)
+        self.assertEqual(child.returncode, 23, child.stderr.decode(errors='replace'))
+        journals = list((self.base / 'crash-backups').glob('*/导入结果.json'))
+        self.assertEqual(len(journals), 1)
+        partial = json.loads(journals[0].read_text(encoding='utf-8'))
+        self.assertEqual(partial['status'], 'publishing')
+        self.assertTrue(partial['backupVerified'])
+        restored = rollback_import(journals[0], self.base / 'cache', confirmed_offline=True)
+        self.assertTrue(restored['rollbackVerified'])
         self.assert_original_targets()
 
     def test_target_drift_after_preview_and_during_staging_never_overwrites(self):
