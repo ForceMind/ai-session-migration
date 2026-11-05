@@ -324,7 +324,7 @@ def make_backup(library, selected: list[SessionRecord], destination: Path, key_p
     sources, seen, asset_info = [], set(), {}
     try:
         progress("取得历史数据库副本", 0)
-        library = library.for_backup(selected)
+        library = library.for_backup(selected, include_projects)
         with zipfile.ZipFile(part, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=3, allowZip64=True) as z:
             for index, record in enumerate(selected):
                 check_cancel(cancel)
@@ -350,6 +350,15 @@ def make_backup(library, selected: list[SessionRecord], destination: Path, key_p
                 if "格式" in record.issue:
                     report["warnings"].append(record.title + "：格式兼容未验证，保留原始记录")
                 catalog["histories"][record.uid] = object_name
+                if record.provider == "codex" and not record.metadata.get("preview_only"):
+                    native_name = "objects/" + str(len(entries)).zfill(8)
+                    native_hash, native_size = hashlib.sha256(), 0
+                    with z.open(native_name, "w", force_zip64=True) as target:
+                        for row in library.native_database_rows(record):
+                            check_cancel(cancel)
+                            raw = (_json(row) + "\n").encode()
+                            target.write(raw); native_hash.update(raw); native_size += len(raw)
+                    entries.append({"object": native_name, "sha256": native_hash.hexdigest(), "size": native_size, "role": "native-database-rows", "logicalName": "codex-native-rows.jsonl", "sessionUid": record.uid})
                 sources.extend((p, role, record.uid) for p, role in library.original_files(record))
                 for attachment in attachments:
                     if attachment.path and Path(attachment.path).is_file():
@@ -400,7 +409,7 @@ def make_backup(library, selected: list[SessionRecord], destination: Path, key_p
                     continue
                 name = "objects/" + str(len(entries)).zfill(8)
                 z.write(stage, name)
-                entries.append({"object": name, **meta, "originalPath": str(p), "role": role, "sessionUid": uid, "sessionUids": sorted(owners[identity]), **asset_info.get(identity, {})})
+                entries.append({"object": name, **meta, "originalPath": str(p), "role": role, "sessionUid": uid, "sessionUids": sorted(owners[identity]), **library.origin_metadata(p), **asset_info.get(identity, {})})
                 stage.unlink(missing_ok=True)
             raw_catalog = _json(catalog).encode()
             z.writestr("catalog.json", raw_catalog)

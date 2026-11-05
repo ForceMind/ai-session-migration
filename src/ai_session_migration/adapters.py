@@ -218,7 +218,7 @@ class LocalLibrary:
                     it.close()
             record = SessionRecord(identity("claude", str(code), sid), "claude", sid, title or ("子任务 · " if child else "未命名会话 · ") + sid[:12], str(code), cwd, timestamp(data.get("lastActivityAt")) or max(p.stat().st_mtime for p in files), bool(data.get("isArchived")), child=child)
             record.files = [str(p) for p in files]
-            record.metadata = {"indexes": [str(p) for p, _ in links], "desktop_ids": sorted({str(d.get("sessionId", "")) for _, d in links}), "primary_file": str(files[0]), "copies": len(files)}
+            record.metadata = {"indexes": [str(p) for p, _ in links], "desktop_ids": sorted({str(d.get("sessionId", "")) for _, d in links}), "primary_file": str(files[0]), "copies": len(files), "origin_cwd": data.get("originCwd", ""), "project_title": Path(str(data.get("originCwd") or cwd)).name if cwd or data.get("originCwd") else ""}
             if len(files) > 1:
                 record.issue = "存在多份原始日志，备份会全部保留"
             record.issue = directory_issue(cwd, self.check_project_paths) or record.issue
@@ -243,6 +243,9 @@ class LocalLibrary:
         c = self.snapshots.connect(databases[-1])
         try:
             columns = {x[1] for x in c.execute("PRAGMA table_info(threads)")}
+            project_titles = {}
+            if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects'").fetchone():
+                project_titles = {row["id"]: row["name"] for row in c.execute("SELECT id,name FROM projects")}
             for row in c.execute("SELECT * FROM threads"):
                 d = dict(row)
                 source = str(d.get("source", ""))
@@ -256,6 +259,8 @@ class LocalLibrary:
                 record.files = [str(p) for p in candidates if owned_file(p, root)]
                 history_dbs = sorted(db_root.glob("thread_history_*.sqlite"))
                 record.metadata = {"state_database": str(databases[-1]), "history_database": str(history_dbs[-1]) if history_dbs else "", "history_mode": d.get("history_mode", "legacy"), "model_provider": d.get("model_provider", ""), "parent_id": d.get("attached_thread_parent_id"), "internal_review": '"guardian"' in source, "native_thread_metadata": d}
+                if d.get("project_id") in project_titles:
+                    record.metadata["project_title"] = project_titles[d["project_id"]]
                 record.issue = directory_issue(cwd, self.check_project_paths)
                 records.append(record)
         finally:
@@ -359,8 +364,9 @@ class LocalLibrary:
                 if isinstance(event, dict):
                     yield event
 
-    def for_backup(self, selected):
+    def for_backup(self, selected, include_projects=False):
         reader = copy.copy(self)
+        reader._include_packaged_projects = include_projects
         reader._fixed_history = {}
         for record in selected:
             if record.provider != "codex" or record.metadata.get("preview_only"):
@@ -372,6 +378,46 @@ class LocalLibrary:
                 if str(source) not in reader._fixed_history:
                     reader._fixed_history[str(source)] = self.snapshots.sqlite(source)
         return reader
+
+    def native_database_rows(self, record):
+        if record.provider != "codex" or record.metadata.get("preview_only"):
+            return
+        paths = [record.metadata.get("state_database"), record.metadata.get("history_database")]
+        for value in paths:
+            if not value or not Path(value).is_file():
+                continue
+            source = Path(value)
+            fixed = getattr(self, "_fixed_history", {}).get(str(source.resolve()))
+            c = sqlite3.connect(Path(fixed).as_uri() + "?mode=ro", uri=True) if fixed else self.snapshots.connect(source)
+            c.row_factory = sqlite3.Row
+            c.execute("PRAGMA query_only=ON")
+            try:
+                schemas = list(c.execute("SELECT name,sql FROM sqlite_master WHERE type='table'"))
+                for table, sql in schemas:
+                    quoted = '"' + table.replace('"', '""') + '"'
+                    columns = {row[1] for row in c.execute("PRAGMA table_info(" + quoted + ")")}
+                    where, args = None, []
+                    if table == "threads" and "id" in columns:
+                        where, args = '"id"=?', [record.session_id]
+                    elif "thread_id" in columns:
+                        where, args = '"thread_id"=?', [record.session_id]
+                    elif {"parent_thread_id", "child_thread_id"} <= columns:
+                        where, args = '"parent_thread_id"=? OR "child_thread_id"=?', [record.session_id] * 2
+                    elif table == "_sqlx_migrations":
+                        where = "1=1"
+                    elif table == "projects" and "id" in columns and record.metadata.get("native_thread_metadata", {}).get("project_id"):
+                        where, args = '"id"=?', [record.metadata["native_thread_metadata"]["project_id"]]
+                    elif "project_id" in columns and record.metadata.get("native_thread_metadata", {}).get("project_id"):
+                        where, args = '"project_id"=?', [record.metadata["native_thread_metadata"]["project_id"]]
+                    if where:
+                        yield {"database": source.name, "table": table, "schemaSql": sql}
+                        for row in c.execute("SELECT * FROM " + quoted + " WHERE " + where, args):
+                            yield {"database": source.name, "table": table, "row": dict(row)}
+            finally:
+                c.close()
+
+    def origin_metadata(self, path):
+        return {"originalPath": str(path)}
 
     def page(self, record: SessionRecord, limit=100, cancel=None) -> SessionPage:
         result = SessionPage()

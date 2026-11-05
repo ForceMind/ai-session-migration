@@ -52,6 +52,7 @@ class PackageLibrary(LocalLibrary):
                 raise ValueError("尚未支持的数据包格式，原文件未改变")
         self.legacy_adapters = {}
         self._legacy_original = {}
+        self._origins = {}
 
     def _extract(self, object_name: str, filename="payload") -> Path:
         with self._extract_lock:
@@ -192,10 +193,31 @@ class PackageLibrary(LocalLibrary):
         if self.package_catalog is not None:
             for name, entry in self.entries.items():
                 if (entry.get("sessionUid") == record.uid or record.uid in entry.get("sessionUids", [])) and entry.get("role") != "lossless-history-export":
-                    yield self._extract(name, Path(entry.get("originalPath", "payload")).name), entry.get("role", "original-session")
+                    if entry.get("role") == "project-work-file" and not getattr(self, "_include_packaged_projects", False):
+                        continue
+                    cached = self._extract(name, Path(entry.get("originalPath") or entry.get("logicalName") or "payload").name)
+                    self._origins[str(cached)] = {"originalPath": entry.get("originalPath") or entry.get("logicalName") or "derived-record", **{k: entry[k] for k in ["logicalName", "displayName", "mediaType"] if k in entry}}
+                    yield cached, entry.get("role", "original-session")
         elif record.provider == "claude":
             for name in record.metadata.get("legacy_objects", []):
-                yield self._extract(name, "history.jsonl"), "original-session"
+                cached = self._extract(name, "history.jsonl")
+                self._origins[str(cached)] = {"originalPath": self.entries[name].get("path", "history.jsonl")}
+                yield cached, "original-session"
+
+    def origin_metadata(self, path):
+        return self._origins.get(str(path), {"originalPath": str(path)})
 
     def selected_registry(self, selected):
-        return self.package_catalog.get("registries", []) if self.package_catalog else []
+        result = []
+        selected_ids = {}
+        for r in selected:
+            if r.provider == "deepseek":
+                selected_ids.setdefault(r.root, set()).add(r.session_id)
+        for raw in self.package_catalog.get("registries", []) if self.package_catalog else []:
+            ids = selected_ids.get(raw.get("sourceRoot"), set())
+            if not ids:
+                continue
+            projects = {wid: {**p, "sessionIds": [s for s in p.get("sessionIds", []) if s in ids]} for wid, p in raw.get("tables", {}).get("workspaces", {}).items() if any(s in ids for s in p.get("sessionIds", []))}
+            g = raw.get("global", {})
+            result.append({**raw, "global": {"workspaceIds": [w for w in g.get("workspaceIds", []) if w in projects], "archivedSessionIds": [s for s in g.get("archivedSessionIds", []) if s in ids], "pinnedSessionIds": [s for s in g.get("pinnedSessionIds", []) if s in ids]}, "tables": {"workspaces": projects}})
+        return result

@@ -204,5 +204,20 @@ class CoreTest(unittest.TestCase):
         with self.assertRaises(ValueError):PackageLibrary(path,self.base/'view')
         self.assertEqual(before,fingerprints(self.home))
 
+    def test_native_rows_and_reexport_provenance_are_preserved(self):
+        records=self.library.scan().records;key=self.base/'key.asmkey';save_recovery_key(key)
+        first=make_backup(self.library,records,self.base/'backups',key)
+        with zipfile.ZipFile(first['portable']) as z:
+            entries=json.loads(z.read('manifest.json'))['entries'];native=next(e for e in entries if e['role']=='native-database-rows');rows=[json.loads(line) for line in z.read(native['object']).splitlines()]
+            self.assertTrue(any(row.get('table')=='threads' and row.get('row',{}).get('id')=='codex-session' for row in rows))
+            self.assertTrue(any(row.get('table')=='thread_items' and 'fixture-existing-reasoning' in row.get('row',{}).get('item_json','') for row in rows))
+        package=PackageLibrary(Path(first['portable']),self.base/'view');subset=[r for r in package.scan().records if r.provider=='claude']
+        second=make_backup(package,subset,self.base/'reexport',key)
+        with zipfile.ZipFile(second['portable']) as z:
+            entries=json.loads(z.read('manifest.json'))['entries'];original=next(e for e in entries if e.get('role')=='original-session')
+            self.assertEqual(original['originalPath'],str(self.files['claude']))
+            self.assertEqual(z.read(original['object']),self.files['claude'].read_bytes())
+            self.assertFalse(json.loads(z.read('catalog.json'))['registries'])
+
 
 if __name__=='__main__':unittest.main()
