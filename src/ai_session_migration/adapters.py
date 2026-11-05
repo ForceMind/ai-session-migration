@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sqlite3
 import tomllib
+import copy
 from urllib.parse import urlparse, unquote
 from typing import Iterator
 
@@ -329,7 +330,13 @@ class LocalLibrary:
             if configured and Path(configured).is_file():
                 databases = [Path(configured)]
             if databases:
-                c = self.snapshots.connect(databases[-1])
+                fixed = getattr(self, "_fixed_history", {}).get(str(databases[-1].resolve()))
+                if fixed:
+                    c = sqlite3.connect(Path(fixed).as_uri() + "?mode=ro", uri=True)
+                    c.execute("PRAGMA query_only=ON")
+                    c.row_factory = sqlite3.Row
+                else:
+                    c = self.snapshots.connect(databases[-1])
                 try:
                     tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                     if "thread_items" in tables:
@@ -351,6 +358,20 @@ class LocalLibrary:
             for event in open_lines(file):
                 if isinstance(event, dict):
                     yield event
+
+    def for_backup(self, selected):
+        reader = copy.copy(self)
+        reader._fixed_history = {}
+        for record in selected:
+            if record.provider != "codex" or record.metadata.get("preview_only"):
+                continue
+            configured = record.metadata.get("history_database")
+            candidates = [Path(configured)] if configured and Path(configured).is_file() else sorted(Path(record.root).glob("thread_history_*.sqlite"))
+            if candidates:
+                source = candidates[-1].resolve()
+                if str(source) not in reader._fixed_history:
+                    reader._fixed_history[str(source)] = self.snapshots.sqlite(source)
+        return reader
 
     def page(self, record: SessionRecord, limit=100, cancel=None) -> SessionPage:
         result = SessionPage()
@@ -376,12 +397,12 @@ class LocalLibrary:
         self._file_attachments(record, result.attachments)
         unique = {}
         for a in result.attachments:
-            unique[(a.path, a.name, hashlib.sha256(a.data[:1000].encode()).hexdigest() if a.data else "")] = a
+            unique[(a.path, a.name, hashlib.sha256(a.data.encode()).hexdigest() if a.data else "")] = a
         result.attachments = list(unique.values())
         result.warnings = list(dict.fromkeys(result.warnings))
         return result
 
-    def _event_attachments(self, record, event, output):
+    def _event_attachments(self, record, event, output, include_embedded=True):
         roots = [Path(record.root) / "projects", Path(record.root) / "uploads", Path(record.root) / "attachments"]
         if record.provider == "codex":
             roots += [Path(record.root) / "generated_images"]
@@ -415,7 +436,7 @@ class LocalLibrary:
                             f = Path(record.root) / "attachments/v1/objects" / aid[:2] / aid
                             output.append(Attachment(str(attachment.get("name") or "图片附件"), str(f) if f.is_file() else "", note="" if f.is_file() else "来源附件缺失", media_type=str(attachment.get("mediaType", ""))))
                     src = value.get("source", {})
-                    if isinstance(src, dict) and src.get("type") == "base64" and isinstance(src.get("data"), str) and len(src["data"]) < 28 * 1024 * 1024:
+                    if include_embedded and isinstance(src, dict) and src.get("type") == "base64" and isinstance(src.get("data"), str) and len(src["data"]) < 28 * 1024 * 1024:
                         output.append(Attachment("会话内嵌图片", kind="embedded", data=src["data"], media_type=str(src.get("media_type", "image/png"))))
                     for key in ["path", "file_path", "filePath"]:
                         p = value.get(key) or (src.get(key) if isinstance(src, dict) else None)

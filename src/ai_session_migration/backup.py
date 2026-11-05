@@ -302,8 +302,9 @@ def make_backup(library, selected: list[SessionRecord], destination: Path, key_p
         raise ValueError("请先选择会话")
     destination = destination.expanduser().resolve()
     key_path = key_path.resolve()
-    for source in library.catalog.sources:
-        root = Path(source["path"])
+    protected = {source["path"] for source in library.catalog.sources} | {r.root for r in selected if not r.metadata.get("preview_only")}
+    for value in protected:
+        root = Path(value)
         if within(destination, root) or within(key_path, root):
             raise ValueError("备份和密钥必须保存在源资料目录之外")
     if within(key_path, destination):
@@ -322,6 +323,8 @@ def make_backup(library, selected: list[SessionRecord], destination: Path, key_p
     stage = output / ".当前文件.tmp"
     sources, seen, asset_info = [], set(), {}
     try:
+        progress("取得历史数据库副本", 0)
+        library = library.for_backup(selected)
         with zipfile.ZipFile(part, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=3, allowZip64=True) as z:
             for index, record in enumerate(selected):
                 check_cancel(cancel)
@@ -340,7 +343,7 @@ def make_backup(library, selected: list[SessionRecord], destination: Path, key_p
                         h.update(raw)
                         size += len(raw)
                         count += 1
-                        library._event_attachments(record, event, attachments)
+                        library._event_attachments(record, event, attachments, include_embedded=False)
                 entries.append({"object": object_name, "sha256": h.hexdigest(), "size": size, "role": "lossless-history-export", "sessionUid": record.uid, "events": count})
                 if not count:
                     report["warnings"].append(record.title + "：未读到已保存的历史事件，保留了目录和可用原始文件")

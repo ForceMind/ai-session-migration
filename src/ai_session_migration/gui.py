@@ -829,6 +829,9 @@ class MainWindow(QMainWindow):
         self.task(load, done, "正在读取迁移包目录", failed)
 
     def new_backup(self):
+        if self.loading:
+            self.error("请等来源读取完成后再选择备份范围。")
+            return
         if self.busy:
             self.error("已有备份任务正在进行。")
             return
