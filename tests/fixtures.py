@@ -1,3 +1,4 @@
+from contextlib import closing
 from pathlib import Path
 import base64
 import hashlib
@@ -68,7 +69,7 @@ def make_import_target(home: Path):
     files = make_home(home)
     files['claude'].rename(files['claude'].with_name('existing-claude.jsonl'))
     for database, table, key in [('state_5.sqlite', 'threads', 'id'), ('thread_history_1.sqlite', 'thread_items', 'thread_id')]:
-        with sqlite3.connect(home / '.codex' / database) as c:
+        with closing(sqlite3.connect(home / '.codex' / database)) as c, c:
             c.execute(f'UPDATE {table} SET {key}=?', ('existing-codex',))
     path = files['deepseek']
     decoder = zstandard.ZstdDecompressor().stream_reader(path.open('rb'), read_across_frames=True)

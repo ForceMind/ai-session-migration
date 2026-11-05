@@ -1,4 +1,5 @@
 import json
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -35,7 +36,7 @@ class ImportTest(unittest.TestCase):
         # Existing native histories use different IDs. Keep their bytes/rows intact.
         files['claude'].rename(files['claude'].with_name('existing-claude.jsonl'))
         for database, table, key in [('state_5.sqlite', 'threads', 'id'), ('thread_history_1.sqlite', 'thread_items', 'thread_id')]:
-            with sqlite3.connect(self.target / '.codex' / database) as c:
+            with closing(sqlite3.connect(self.target / '.codex' / database)) as c, c:
                 c.execute(f'UPDATE {table} SET {key}=?', ('existing-codex',))
         path = files['deepseek']
         rows = list(open_lines(path)); rows[0]['id'] = 'existing-harness'
@@ -86,7 +87,7 @@ class ImportTest(unittest.TestCase):
             if record.provider == 'deepseek':
                 self.assertTrue(record.archived)
                 self.assertTrue(page.attachments)
-        with sqlite3.connect(self.target / '.codex/thread_history_1.sqlite') as c:
+        with closing(sqlite3.connect(self.target / '.codex/thread_history_1.sqlite')) as c, c:
             old = c.execute('SELECT item_json FROM thread_items WHERE thread_id=? ORDER BY rollout_ordinal', ('existing-codex',)).fetchall()
             new = c.execute('SELECT item_json FROM thread_items WHERE thread_id=? ORDER BY rollout_ordinal', ('codex-session',)).fetchall()
             self.assertEqual(old, new)  # byte-identical item_json, including reasoning
@@ -145,7 +146,7 @@ class ImportTest(unittest.TestCase):
         self.assert_original_targets()
 
     def test_unknown_target_schema_is_blocked_at_preview_without_original_writes(self):
-        with sqlite3.connect(self.target / '.codex/state_5.sqlite') as c:
+        with closing(sqlite3.connect(self.target / '.codex/state_5.sqlite')) as c, c:
             sql = c.execute("SELECT sql FROM sqlite_master WHERE name='threads'").fetchone()[0]
             columns = [r[1] for r in c.execute('PRAGMA table_info(threads)')]
             c.execute('ALTER TABLE threads RENAME TO old_threads')
@@ -232,6 +233,23 @@ class ImportTest(unittest.TestCase):
         self.assertTrue(report['backupVerified'])
         self.assertEqual(self.source_before, fingerprints(self.source))
 
+    def test_child_session_requires_parent_and_keeps_native_claude_layout(self):
+        original = self.source / '.claude/projects/example/claude-session/subagents/agent-child.jsonl'
+        original.parent.mkdir(parents=True)
+        original.write_text(json.dumps({'type': 'user', 'sessionId': 'agent-child', 'cwd': str(self.source / '示例项目'), 'message': {'role': 'user', 'content': 'synthetic child task'}}) + '\n')
+        self.reexport()
+        child = next(r for r in self.selected if r.session_id == 'agent-child')
+        alone = self.plan([child])
+        self.assertEqual(alone.items[0]['action'], 'blocked')
+        self.assertIn('父会话', alone.items[0]['reason'])
+        report = self.execute()
+        self.assertEqual(report['status'], 'complete')
+        reader = LocalLibrary(self.target, self.base / 'child-readback')
+        restored = next(r for r in reader.scan().records if r.session_id == 'agent-child')
+        self.assertTrue(restored.child)
+        self.assertEqual(Path(restored.files[0]).parts[-3:], ('claude-session', 'subagents', 'agent-child.jsonl'))
+        self.assertEqual(self.source_before, fingerprints(self.source))
+
     def test_native_projects_turns_compressed_rollout_offsets_and_policy_reset(self):
         source_log = self.source / '.codex/sessions/rollout-codex-session.jsonl.zst'
         source_log.parent.mkdir()
@@ -239,7 +257,7 @@ class ImportTest(unittest.TestCase):
         raw = ''.join(lines).encode()
         source_log.write_bytes(zstandard.ZstdCompressor(write_checksum=True).compress(raw))
         for home in [self.source, self.target]:
-            with sqlite3.connect(home / '.codex/state_5.sqlite') as c:
+            with closing(sqlite3.connect(home / '.codex/state_5.sqlite')) as c, c:
                 c.execute('CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, metadata TEXT NOT NULL, position INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)')
                 c.execute('CREATE TABLE project_roots (project_id TEXT REFERENCES projects(id), position INTEGER, path TEXT, PRIMARY KEY(project_id, position))')
                 c.execute('INSERT INTO projects VALUES (?,?,?,?,?,?)', ('project-1', 'fixture', '{"privateConfig":"do-not-restore"}', 0, 1, 1))
@@ -252,7 +270,7 @@ class ImportTest(unittest.TestCase):
                 c.execute('UPDATE threads SET project_id=?', ('project-1',))
                 if home == self.source:
                     c.execute('UPDATE threads SET rollout_path=?', (str(source_log.with_suffix('')),))
-            with sqlite3.connect(home / '.codex/thread_history_1.sqlite') as c:
+            with closing(sqlite3.connect(home / '.codex/thread_history_1.sqlite')) as c, c:
                 c.execute('CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, rollout_ordinal INTEGER, status TEXT, rollout_byte_offset INTEGER, rollout_end_byte_offset INTEGER, PRIMARY KEY(thread_id,turn_id))')
                 c.execute('CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER NOT NULL, next_rollout_ordinal INTEGER NOT NULL)')
                 sid = 'codex-session' if home == self.source else 'existing-codex'
@@ -261,7 +279,7 @@ class ImportTest(unittest.TestCase):
         self.reexport()
         report = self.execute()
         self.assertEqual(report['status'], 'complete')
-        with sqlite3.connect(self.target / '.codex/state_5.sqlite') as c:
+        with closing(sqlite3.connect(self.target / '.codex/state_5.sqlite')) as c, c:
             row = c.execute('SELECT rollout_path,sandbox_policy,approval_mode,memory_mode,creator_account_id,project_id FROM threads WHERE id=?', ('codex-session',)).fetchone()
             self.assertTrue(Path(row[0]).is_file())
             self.assertEqual(row[1:5], ('{"type":"read-only"}', 'on-request', 'disabled', None))
@@ -272,7 +290,7 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(restored_lines[1]['payload']['approval_policy'], 'on-request')
         with zstandard.ZstdDecompressor().stream_reader(Path(row[0]).open('rb'), read_across_frames=True) as reader:
             restored_raw = reader.read()
-        with sqlite3.connect(self.target / '.codex/thread_history_1.sqlite') as c:
+        with closing(sqlite3.connect(self.target / '.codex/thread_history_1.sqlite')) as c, c:
             self.assertEqual(c.execute('SELECT status FROM thread_turns WHERE thread_id=?', ('codex-session',)).fetchone()[0], 'interrupted')
             self.assertEqual(c.execute('SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id=?', ('codex-session',)).fetchone()[0], len(restored_raw))
         self.assertEqual(self.source_before, fingerprints(self.source))

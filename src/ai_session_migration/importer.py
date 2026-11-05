@@ -205,7 +205,7 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
     if not selected:
         raise ValueError("请先选择要导入的包内会话")
     if package.package_catalog is None:
-        raise ValueError("此旧数据包只支持预览；请用本工具重新导出所选会话后导入")
+        raise ValueError("此旧数据包只支持预览；请回到源电脑重新识别本地资料，并用新版导出后导入")
     verify_package(package.archive, progress, cancel)
     package = PackageLibrary(package.archive, cache)
     records = {r.uid: r for r in package.scan().records}
@@ -300,6 +300,34 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
         except (ValueError, OSError) as error:
             item.update(action="blocked", reason=str(error))
         items.append(item)
+    # A child must keep its parent relationship, rather than silently becoming a root.
+    dependencies = {}
+    for item in items:
+        if item["action"] != "import":
+            continue
+        record = SessionRecord.from_dict(item["record"])
+        parent = None
+        if record.provider == "claude" and record.child:
+            logs = source_logs(package, record)
+            rel = logs[0][1] if logs else None
+            if rel and len(rel.parts) >= 5 and rel.parts[3] == "subagents":
+                parent = rel.parts[2]
+        elif record.provider == "codex":
+            parent = record.metadata.get("parent_id")
+        elif record.provider == "deepseek":
+            parent = next(package.raw_events(record), {}).get("parentSession")
+        if parent:
+            dependencies[(record.provider, record.session_id)] = str(parent)
+    changed = True
+    while changed:
+        changed = False
+        available = {(i["record"]["provider"], i["record"]["session_id"]) for i in items if i["action"] == "import"}
+        available.update((p, sid) for p, values in existing.items() for sid in values)
+        for item in items:
+            key = (item["record"]["provider"], item["record"]["session_id"])
+            if item["action"] == "import" and key in dependencies and (key[0], dependencies[key]) not in available:
+                item.update(action="blocked", reason="父会话未选择或不可导入；请同时选择父会话，保留父子关系")
+                changed = True
     # Include only providers that can actually receive at least one session.
     active = {i["record"]["provider"] for i in items if i["action"] == "import"}
     if "claude" in active and "claude_desktop" in clean:
@@ -452,6 +480,7 @@ def _codex_stage(package, items, root: Path, cancel):
     rows = []
     roots_by_project, project_map = {}, {}
     try:
+        available_ids = ids | {r[0] for r in connections["state"].execute("SELECT id FROM threads")}
         original_state, original_history = codex_databases(Path(items[0]["target_root"]))
         for key, c in connections.items():
             if c:
@@ -478,7 +507,7 @@ def _codex_stage(package, items, root: Path, cancel):
                 raise ValueError("包内 Codex 索引超出所选会话")
             if "thread_id" in row and row["thread_id"] != item["record"]["session_id"]:
                 raise ValueError("包内分页历史超出所选会话")
-            if table == "thread_spawn_edges" and not {row.get("parent_thread_id"), row.get("child_thread_id")} <= ids:
+            if table == "thread_spawn_edges" and (row.get("child_thread_id") not in ids or row.get("parent_thread_id") not in available_ids):
                 continue
             if table == "threads":
                 row["cwd"] = item["cwd"]
@@ -486,7 +515,7 @@ def _codex_stage(package, items, root: Path, cancel):
                 for name, value in {"sandbox_policy": '{"type":"read-only"}', "approval_mode": "on-request", "memory_mode": "disabled", "daybreak_enabled": False, "creator_user_id": None, "creator_account_id": None, "thread_section_id": None}.items():
                     if name in row:
                         row[name] = value
-                if row.get("attached_thread_parent_id") not in ids:
+                if row.get("attached_thread_parent_id") not in available_ids:
                     row["attached_thread_parent_id"] = None if "attached_thread_parent_id" in row else row.get("attached_thread_parent_id")
                     if "attached_thread_parent_id" not in entry["row"]:
                         row.pop("attached_thread_parent_id", None)
@@ -573,20 +602,21 @@ def _stage_sessions(package, items, stages, cancel):
                 suffix = suffix if re.fullmatch(r"\.[a-z0-9]{1,12}", suffix) else ".bin"
                 destination_asset = root / "attachments" / ("asm-" + sid) / (asset["object"].split("/")[-1] + suffix)
                 # Tool result paths owned by a Claude session remain at their canonical relative positions.
-                if record.provider == "claude" and rel and sid in rel.parts[:-1]:
-                    index = rel.parts.index(sid)
+                if record.provider == "claude" and rel and rel.parts[0] == "projects" and len(rel.parts) >= 4:
                     project = re.sub(r"[^A-Za-z0-9]", "-", item["cwd"])
                     destination_asset = root / "projects" / project
-                    destination_asset = destination_asset.joinpath(*rel.parts[index:])
+                    destination_asset = destination_asset.joinpath(*rel.parts[2:])
             _copy_new(package._extract(asset["object"], destination_asset.name), destination_asset)
             attachment_map[original_path] = str(Path(item["target_root"]) / destination_asset.relative_to(root))
         item["attachment_map"] = attachment_map
         if record.provider == "claude":
             project = re.sub(r"[^A-Za-z0-9]", "-", item["cwd"])
-            destination = root / "projects" / project / (sid + ".jsonl")
             preferred = record.metadata.get("primary_file")
             chosen = next(((e, rel) for e, rel in logs if e.get("originalPath") == preferred), logs[0])
             e, original = chosen
+            if original.parts[0] != "projects" or len(original.parts) < 3 or original.name != sid + ".jsonl":
+                raise ValueError("Claude 原始项目日志位置不兼容")
+            destination = (root / "projects" / project).joinpath(*original.parts[2:])
             _rewrite_log(package._extract(e["object"], original.name), destination, "claude", item["cwd"], cancel, sid, attachment_map)
             item["source_session_dir"] = str(original.parent / sid)
             item["session_dir"] = str(destination.parent / sid)

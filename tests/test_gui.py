@@ -19,6 +19,8 @@ class GuiTest(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.base=Path(self.temp.name).resolve();make_home(self.base/'home')
         self.window=MainWindow(self.base/'home',self.base/'state')
+        self.errors=[]
+        self.window.error=self.errors.append
         self.window.library=LocalLibrary(self.base/'home',self.base/'cache')
         self.catalog=self.window.library.scan()
         # Prevent asynchronous reads in these focused native widget tests.
@@ -59,6 +61,7 @@ class GuiTest(unittest.TestCase):
         while self.window.tasks and time.monotonic()<limit:
             APP.processEvents();time.sleep(0.01)
         self.assertFalse(self.window.tasks)
+        self.assertFalse(self.errors, '\n'.join(self.errors))
 
     def test_native_import_wizard_preview_confirmation_restore_and_undo(self):
         before=fingerprints(self.base/'home')
