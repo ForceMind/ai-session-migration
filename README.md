@@ -2,6 +2,8 @@
 
 面向 Claude Code、Codex 与 DeepSeek Harness 的开源本地桌面会话查看、管理、备份与导入工具。
 
+[软件官网](https://ai-session-migration.pages.dev/) · [下载 0.2.0 预览版](https://github.com/ForceMind/ai-session-migration/releases/tag/v0.2.0) · [官网发布说明](docs/WEBSITE.md)
+
 **0.2.0 已实现 GUI 原生导入。** 通过界面打开迁移包、选择会话、映射目标项目、预览冲突、完整备份目标资料后恢复。用户无需安装 Python 或运行脚本命令。真实 Windows 资料导入、跨账号/组织/供应商兼容及真实续聊仍等待用户目标电脑验证。
 
 ![已确认的原生界面基础，合成资料；0.2.0 新增导入入口](assets/screenshots/native-mac-fixtures.png)

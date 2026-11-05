@@ -19,3 +19,4 @@ backups/
 *.exe
 *.app/
 local-state.json
+.wrangler/
