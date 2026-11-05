@@ -13,7 +13,7 @@ import zipfile
 from .adapters import LocalLibrary, claude_messages, codex_messages, dsh_messages
 from .backup import SCHEMA
 from .models import Attachment, Catalog, SessionPage, SessionRecord, identity
-from .safeio import CHUNK, ReadFailure, SnapshotStore, open_lines, read_json, independent_copy
+from .safeio import CHUNK, ReadFailure, SnapshotStore, open_lines, read_json, independent_copy, hash_file
 
 
 class PackageLibrary(LocalLibrary):
@@ -66,7 +66,7 @@ class PackageLibrary(LocalLibrary):
         if not re.fullmatch(r"\.[a-z0-9]{1,12}", suffix):
             suffix = ".bin"
         target = self.cache / (object_name.split("/")[-1] + "-payload" + suffix)
-        if target.exists() and target.stat().st_size == entry["size"]:
+        if target.exists() and target.stat().st_size == entry["size"] and hash_file(target) == entry["sha256"]:
             return target
         if shutil.disk_usage(self.cache).free < entry["size"] + 128 * CHUNK:
             raise ReadFailure("预览该数据对象需要更多缓存空间，请在设置中更改缓存位置")

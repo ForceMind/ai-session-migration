@@ -2,12 +2,13 @@
 
 ## 当前进度
 
-2026-11-05：UI Design 01 已获用户确认；GUI 首版 0.1.0 已完成并交付 Mac arm64 独立应用、只读 DMG 和 Windows x64 客户端包。三来源真实只读解析、历史与附件、独立标记/迁移清单、图形化备份与 GCM 加密回读、迁移包预览均已接通。可选会话工作目录文件，排除 Git 元数据、依赖缓存及独立凭据。源会话、归档与 thinking 保留。
+2026-11-05：0.1.0 查看与备份客户端已交付。用户继续批准 0.2.0 GUI 原生导入：Claude Code 本地会话、Codex、DeepSeek Harness；先备份目标资料并预览冲突，不覆盖现有对话。真实 Windows 导入、账号/组织/供应商兼容与续聊仍待新电脑，不执行真实本机导入或冷备份。
 
-本轮验收：19 项测试通过；Mac 打包程序正常桌面启动与 Cocoa 合成流程通过，三来源真实读取通过，代表性真实备份逐文件校验、加密回读及原日志哈希保持通过。Mac 应用内置运行环境，临时签名完整性与 DMG 校验通过，尚未 Apple 公证。Windows 完整 CI、独立构建及打包 EXE 的 offscreen 合成资料检查通过，见 [最终运行时代码 CI](https://github.com/ForceMind/ai-session-migration/actions/runs/41960704789)。运行时代码为 `dafed55932d3fd71ad6034e40a65d9c9f32e5fec`；后续说明和合成截图更新不改变该构建。
+当前迭代：在迁移包视图选择会话 → 指定三来源目标目录与项目映射 → 校验数据包和目标格式 → 预览新增/同 ID 跳过/不支持项 → 确认客户端已退出 → 完整备份所选目标资料 → 在独立副本合并 → 持久化日志后发布 → 核验与可撤销结果。新增日志只映射必要目录字段，thinking 与历史正文保留；不恢复权限、Goals、队列、服务登录或执行历史工具。
 
-当前迭代已完成。Windows 真实设备窗口、原生导入、跨账号/组织/供应商兼容及真实续聊仍待目标电脑；最终冷备份继续暂缓，未调用模型，未启动浏览器测试。后续导入需要独立实现与验证，不能把本版数据包预览等同于原客户端恢复。
+涉及 `importer.py`、`gui.py`、原生导出附件/索引契约、导入测试、打包与 CI。原生导入只接受可验证格式；Codex 目标需由目标客户端初始化数据库，拒绝执行数据包中的 SQL 或猜测未知模式。冲突默认跳过，目标现有文件和行保留；发布前源变动则拒绝提交。目标备份含私密资料，专用目录保管。隔离合成资料验证三来源、冲突、路径、未知模式、取消、失败和撤销；浏览器未验证，不启动浏览器测试。
 
+进度：导入引擎与原生向导接通，33 项测试通过，包含三来源恢复、完整目标备份、冲突、目标变动、发布失败/撤销、Desktop 索引目标容器、Codex 项目/turn/压缩偏移与权限基线。当前准备 0.2.0 双击客户端，并通过打包程序在隔离合成目录验证导入、重复跳过和撤销。实现分支 `gui-import-recovery`，验收后以快进同步公开仓库 main，不包含真实资料。
 目标：独立公开的桌面工具，通过图形界面查看和管理 Claude、Codex、DeepSeek Harness 会话，在 Mac 侧准备备份与迁移包，并在目标 Windows 电脑验证导入和续聊。用户不需要操作终端、安装开发依赖或手动拼装脚本命令。
 
 ## 当前迭代
@@ -63,3 +64,9 @@ Qt 的独立分发工具支持 macOS 应用包与 Windows 可执行文件，具�
 ## 后续迭代
 
 在可用客户端上继续：Windows 目标目录映射与冲突预览 → 目标备份与受控导入/回退 → 原生列表与正文验证 → 用户授权后的真实续聊。所有阶段沿用同一份进度记录，保留源 Mac 和已有备份。
+
+## 原生导入契约来源
+
+- [Claude 官方会话说明](https://code.claude.com/docs/en/how-claude-code-works)：本地历史与云端内容范围分别处理。Desktop Code 索引以本机已安装版本的字段证据适配，目标显示仍待原客户端验证。
+- [Codex 上游索引实现](https://github.com/openai/codex/blob/main/codex-rs/state/src/runtime/threads.rs) 与 [rollout 迁移实现](https://github.com/openai/codex/blob/main/codex-rs/thread-store/src/local/rollout_migration.rs)：元数据索引、分页历史、原始日志及位置不能混作单一文件。目标使用原客户端已初始化模式；数据包中的 schemaSql 不执行。
+- [DeepSeek 持久化契约](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/session/session-persistence-jsonl/src/format.ts)：项目/会话段编码、cwd 身份与 canonical generation；[实现](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/session/session-persistence-jsonl/src/index.ts)要求首个压缩帧恰好是一行日志头。

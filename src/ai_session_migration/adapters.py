@@ -129,6 +129,7 @@ class LocalLibrary:
         self.check_project_paths = check_project_paths
         protected = [self.home / ".claude", self.home / ".codex", self.home / ".dsh", self.home / "Library/Application Support/Claude", self.home / "Library/Application Support/Codex"] + [Path(s["path"]) for s in self.custom_sources if s.get("path")]
         protected.extend(p for p in (self.home / "Library/Application Support").glob("Claude-*") if p.is_dir())
+        protected.extend(p for p in (self.home / "AppData/Roaming").glob("Claude*") if p.is_dir())
         protected.extend(Path(os.environ[v]).expanduser() for v in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "DSH_HOME"] if os.environ.get(v))
         if any(within(cache, root) for root in protected):
             raise ValueError("本工具缓存不能保存在来源资料中")
@@ -180,6 +181,9 @@ class LocalLibrary:
             return []
         index = defaultdict(list)
         profiles = list((self.home / "Library/Application Support").glob("Claude*"))
+        profiles += list((self.home / "AppData/Roaming").glob("Claude*"))
+        if self.home == Path.home().resolve() and os.environ.get("APPDATA"):
+            profiles += list(Path(os.environ["APPDATA"]).glob("Claude*"))
         if (root / "claude-code-sessions").is_dir():
             profiles.append(root)
         for profile in set(profiles):
@@ -225,17 +229,19 @@ class LocalLibrary:
             records.append(record)
         return records
 
-    def _scan_codex(self, root: Path):
+    def _scan_codex(self, root: Path, db_root_override=None):
         db_root = root
         try:
             config = tomllib.loads(stable_bytes(root / "config.toml", 2 * 1024 * 1024).decode())
             override = config.get("sqlite_db_path")
-            if isinstance(override, str) and Path(override).expanduser().is_dir():
+            if db_root_override is None and isinstance(override, str) and Path(override).expanduser().is_dir():
                 db_root = Path(override).expanduser().resolve()
                 if within(self.snapshots.directory, db_root):
                     raise ValueError("缓存不能位于历史数据库目录中")
         except (OSError, tomllib.TOMLDecodeError):
             pass
+        if db_root_override is not None:
+            db_root = Path(db_root_override)
         databases = sorted(db_root.glob("state_*.sqlite"), key=lambda p: int(re.search(r"_(\d+)\.sqlite", p.name)[1]))
         if not databases:
             return self._scan_codex_logs(root)
@@ -521,6 +527,11 @@ class LocalLibrary:
     def original_files(self, record: SessionRecord):
         """Only session-owned paths; never collect arbitrary paths from history text."""
         result = []
+        if record.provider == "claude":
+            for value in record.metadata.get("indexes", []):
+                p = Path(value)
+                if p.name.startswith("local_") and p.suffix == ".json" and p.is_file() and not p.is_symlink():
+                    result.append((p, "claude-desktop-index"))
         root = Path(record.root)
         for value in record.files:
             f = Path(value)

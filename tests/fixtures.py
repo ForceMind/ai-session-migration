@@ -62,3 +62,22 @@ def make_home(home: Path):
     (cache / "harness-session.json").write_text(json.dumps({"record": {"identity": {"formatVersion": 4, "createdAt": 1000, "isSeeded": False}, "rows": {"title": {"val": "梳理文档的阅读顺序"}}}}, ensure_ascii=False))
     (dsh / ".credentials.yaml").write_text("token: synthetic-secret-not-for-export\n")
     return {"claude": c, "deepseek": session / "session.v4.jsonl.zstd", "project": project}
+
+
+def make_import_target(home: Path):
+    files = make_home(home)
+    files['claude'].rename(files['claude'].with_name('existing-claude.jsonl'))
+    for database, table, key in [('state_5.sqlite', 'threads', 'id'), ('thread_history_1.sqlite', 'thread_items', 'thread_id')]:
+        with sqlite3.connect(home / '.codex' / database) as c:
+            c.execute(f'UPDATE {table} SET {key}=?', ('existing-codex',))
+    path = files['deepseek']
+    decoder = zstandard.ZstdDecompressor().stream_reader(path.open('rb'), read_across_frames=True)
+    with decoder:
+        rows = [json.loads(line) for line in decoder.read().splitlines()]
+    rows[0]['id'] = 'existing-harness'
+    compressor = zstandard.ZstdCompressor(write_checksum=True)
+    path.write_bytes(b''.join(compressor.compress((json.dumps(r) + '\n').encode()) for r in rows))
+    path.parent.rename(path.parent.with_name('existing-harness'))
+    registry = home / '.dsh/storages/workspace.json'
+    registry.write_text(registry.read_text().replace('harness-session', 'existing-harness'))
+    return files

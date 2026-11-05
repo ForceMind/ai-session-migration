@@ -13,8 +13,41 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QFont, QIcon, QPalette, QColor
 from PySide6.QtWidgets import QApplication
 
+from . import __version__
 from .gui import MainWindow
 from .safeio import atomic_json, within
+
+
+def synthetic_import_acceptance(window):
+    """Packaged-program qualification on pre-created, isolated synthetic homes only."""
+    from .backup import make_backup, save_recovery_key
+    from .packages import PackageLibrary
+    from .importer import build_plan, execute_import, rollback_import, inventory
+    from .safeio import hash_file
+    if window.home.resolve() == Path.home().resolve() or {r.session_id for r in window.records} != {"claude-session", "codex-session", "harness-session"}:
+        raise ValueError("Synthetic import qualification refuses real or unknown source data")
+    target = window.state.root / "synthetic-import-target"
+    if not (target / "示例项目").is_dir():
+        raise ValueError("Synthetic target must be prepared by the acceptance fixture generator")
+    before_source = {str(p): hash_file(p) for p in window.home.rglob("*") if p.is_file()}
+    key = window.state.root / "synthetic-recovery.asmkey"
+    save_recovery_key(key)
+    exported = make_backup(window.library, window.records, window.state.root / "synthetic-export", key)
+    package = PackageLibrary(Path(exported["portable"]), window.state.cache)
+    selected = package.scan().records
+    targets = {p: str(target / d) for p, d in [("claude", ".claude"), ("codex", ".codex"), ("deepseek", ".dsh")]}
+    before = {p: inventory(Path(root)) for p, root in targets.items()}
+    plan = build_plan(package, selected, targets, {r.cwd: str(target / "示例项目") for r in selected}, window.state.cache)
+    if len(plan.ready) != 3:
+        raise ValueError("Synthetic import preview did not admit all three providers")
+    report = execute_import(plan, window.state.root / "synthetic-target-backups", window.state.cache, confirmed_offline=True)
+    duplicate = build_plan(package, selected, targets, {r.cwd: str(target / "示例项目") for r in selected}, window.state.cache)
+    restored = rollback_import(Path(report["journal"]), window.state.cache, confirmed_offline=True)
+    source_unchanged = before_source == {str(p): hash_file(p) for p in window.home.rglob("*") if p.is_file()}
+    target_restored = before == {p: inventory(Path(root)) for p, root in targets.items()}
+    result = {"syntheticOnly": True, "providers": sorted(targets), "imported": report["imported"], "backupVerified": report["backupVerified"], "nativeReadback": report["nativeReadback"], "duplicateIdsSkipped": len(duplicate.ready) == 0, "rollbackVerified": restored["rollbackVerified"] and target_restored, "sourceFilesUnchanged": source_unchanged}
+    result["ok"] = report["status"] == "complete" and all(result[k] for k in ["backupVerified", "duplicateIdsSkipped", "rollbackVerified", "sourceFilesUnchanged"])
+    return result
 
 
 def main():
@@ -25,9 +58,12 @@ def main():
     parser.add_argument("--smoke-report")
     parser.add_argument("--smoke-screenshot")
     parser.add_argument("--smoke-real", action="store_true")
+    parser.add_argument("--smoke-import", action="store_true")
     args, _ = parser.parse_known_args()
-    if any([args.smoke_home, args.smoke_state, args.smoke_report, args.smoke_screenshot, args.smoke_real]) and os.environ.get("ASM_ACCEPTANCE_TEST") != "1":
+    if any([args.smoke_home, args.smoke_state, args.smoke_report, args.smoke_screenshot, args.smoke_real, args.smoke_import]) and os.environ.get("ASM_ACCEPTANCE_TEST") != "1":
         raise SystemExit("Internal acceptance hooks are disabled for normal application launches")
+    if args.smoke_import and (not args.smoke_report or not args.smoke_state or not args.smoke_home or args.smoke_real or Path(args.smoke_home).resolve() == Path.home().resolve()):
+        raise SystemExit("Import acceptance requires isolated synthetic homes and a report")
     if args.smoke_report:
         roots = []
         for home in {Path.home().resolve(), Path(args.smoke_home or Path.home()).resolve()}:
@@ -42,7 +78,7 @@ def main():
     app = QApplication(sys.argv[:1])
     app.setApplicationName("AI Session Migration")
     app.setOrganizationName("ForceMind")
-    app.setApplicationVersion("0.1.0")
+    app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
     font = QFont()
     font.setFamily("PingFang SC" if sys.platform == "darwin" else "Segoe UI" if sys.platform == "win32" else "DejaVu Sans")
@@ -107,8 +143,12 @@ def main():
                                 break
                         if provider not in checks:
                             checks[provider] = {"messages": 0}
+                    if args.smoke_import:
+                        checks["syntheticImport"] = synthetic_import_acceptance(window)
                     return checks
                 def read_done(checks):
+                    if "syntheticImport" in checks:
+                        result["syntheticImport"] = checks.pop("syntheticImport")
                     result["readChecks"] = checks
                     state["read_done"] = True
                 def read_failed(error):
@@ -120,6 +160,8 @@ def main():
                 QTimer.singleShot(100, poll)
                 return
             result["ok"] = not state["read_error"] and all(result.get("readChecks", {}).get(p, {}).get("messages", 0) > 0 for p in ["claude", "codex", "deepseek"])
+            if args.smoke_import:
+                result["ok"] = result["ok"] and result.get("syntheticImport", {}).get("ok", False)
             if args.smoke_screenshot:
                 # Only synthetic fixtures may be captured for sharable screenshots.
                 if real_data:

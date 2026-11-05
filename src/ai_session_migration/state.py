@@ -36,3 +36,9 @@ class AppState:
     def record_backup(self, report):
         self.data.setdefault("backups", []).insert(0, {k: report.get(k) for k in ["schema", "status", "output", "portable", "encrypted", "startedAt", "finishedAt", "sessions", "files", "bytes", "warnings", "encryptedReadbackVerified", "keyPath", "plainSha256", "error", "archiveReady", "pendingArchive", "attempts"]})
         self.save()
+
+    def record_import(self, report):
+        records = self.data.setdefault("imports", [])
+        records[:] = [r for r in records if r.get("journal") != report.get("journal")]
+        records.insert(0, {k: report.get(k) for k in ["schema", "status", "output", "journal", "startedAt", "finishedAt", "imported", "skipped", "backup", "backupVerified", "targetReadbackVerified", "rollbackVerified", "error", "recoveryError"]})
+        self.save()
