@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import struct
+import stat
 import zipfile
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -30,14 +31,40 @@ def cancelled(cancel):
         raise Cancelled("任务已取消；原始资料未改变")
 
 
-def identity(path):
-    path = Path(path)
-    if path.is_symlink():
-        raise ValueError("恢复来源不能是符号链接")
-    s = path.stat()
-    if not path.is_file():
+def descriptor_identity(fd):
+    """Use one stat API for saved identities and opened-handle comparisons.
+
+    Windows path-stat and descriptor-stat can expose different file identifiers
+    or timestamp precision. Compare descriptor records to descriptor records.
+    """
+    s = os.fstat(fd)
+    if not stat.S_ISREG(s.st_mode):
         raise ValueError("恢复来源不是普通文件")
     return [s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns]
+
+
+def open_regular(path, expected=None):
+    path = Path(path)
+    # Check before opening so a FIFO/device cannot block. O_NONBLOCK covers a
+    # replacement between lstat and open on POSIX; fstat then rejects its type.
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("恢复来源不是普通文件或为符号链接")
+    flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(path, flags)
+    try:
+        opened = descriptor_identity(fd)
+        if expected is not None and opened != list(expected):
+            raise ValueError('备份来源在打开时改变')
+        return os.fdopen(fd, 'rb')
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def identity(path):
+    with open_regular(path) as f:
+        return descriptor_identity(f.fileno())
 
 
 def check_identity(path, expected):
@@ -46,7 +73,7 @@ def check_identity(path, expected):
 
 
 def asmb_header(path):
-    with Path(path).open('rb') as f:
+    with open_regular(path) as f:
         if f.read(len(MAGIC)) != MAGIC:
             raise ValueError("加密备份格式不受支持")
         length = f.read(4)
@@ -81,7 +108,7 @@ def authenticate(path, key_path=None, auth_path=None, progress=lambda *_: None, 
         length = before[2] - start - 16
         if length < 0 or length >= 2**36 - 32:
             raise ValueError("加密备份长度无效")
-        with path.open('rb') as f:
+        with open_regular(path, before) as f:
             f.seek(-16, 2)
             tag = f.read(16)
             decoder = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
@@ -107,7 +134,7 @@ def authenticate(path, key_path=None, auth_path=None, progress=lambda *_: None, 
         meta = json.loads(bounded_bytes(auth_path, 65536))
         mac = hmac.new(hashlib.sha256(b'backup-auth-v1\0' + password).digest(), digestmod='sha256')
         sha = hashlib.sha256()
-        with path.open('rb') as f:
+        with open_regular(path, before) as f:
             count = 0
             while block := f.read(CHUNK):
                 cancelled(cancel)
@@ -120,7 +147,7 @@ def authenticate(path, key_path=None, auth_path=None, progress=lambda *_: None, 
 
 
 def bounded_bytes(path, maximum=MAX_VALUE):
-    with Path(path).open('rb') as f:
+    with open_regular(path) as f:
         data = f.read(maximum + 1)
     if len(data) > maximum:
         raise ValueError("元数据超过读取上限")
@@ -131,11 +158,7 @@ class ArchiveReader(io.RawIOBase):
     def __init__(self, path, expected, key_path=None):
         check_identity(path, expected)
         self.path = Path(path); self.expected = expected
-        self.file = self.path.open('rb'); self.position = 0
-        opened = os.fstat(self.file.fileno())
-        if [opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns] != list(expected):
-            self.file.close()
-            raise ValueError('备份来源在打开时改变')
+        self.file = open_regular(self.path, expected); self.position = 0
         self.mode = 'plain'; self.start = 0; self.length = expected[2]
         try:
             if self.path.suffix.lower() == '.asmb':
@@ -258,7 +281,12 @@ def central_entries(reader):
 
 
 def zip_member(reader, fields):
-    info = zipfile.ZipInfo(fields['filename'])
+    raw_filename = fields['filename']
+    info = zipfile.ZipInfo(raw_filename)
+    # ZipInfo normalizes the host separator on Windows. The central directory
+    # contains POSIX source names, including literal backslashes from macOS.
+    info.filename = raw_filename
+    info.orig_filename = raw_filename
     for k, v in fields.items():
         if k != 'filename': setattr(info, k, v)
     if info.flag_bits & 1: raise ValueError("内层加密 ZIP 不受支持")
@@ -267,7 +295,7 @@ def zip_member(reader, fields):
     n, e = struct.unpack_from('<HH', header, 26)
     raw = _read_exact(reader, n); _read_exact(reader, e)
     name = raw.decode('utf-8' if info.flag_bits & 2048 else 'cp437')
-    if name != info.filename or int.from_bytes(header[8:10], 'little') != info.compress_type:
+    if name != raw_filename or int.from_bytes(header[8:10], 'little') != info.compress_type:
         raise ValueError("ZIP 对象头与目录不一致")
     if reader.tell() + info.compress_size > reader.length: raise ValueError("ZIP 对象越界")
     return zipfile.ZipExtFile(reader, 'r', info, close_fileobj=False)

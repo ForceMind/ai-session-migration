@@ -3,6 +3,8 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import json
+import os
+import stat
 from pathlib import Path
 import shutil
 import tempfile
@@ -23,7 +25,11 @@ def write_zip(path, files):
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as z:
         for name, data in files.items():
-            z.writestr(name, json.dumps(data).encode() if isinstance(data, (dict, list)) else data)
+            info = zipfile.ZipInfo(name)
+            # Model the source Mac ZIP, not Windows ZipInfo separator rewriting.
+            info.filename = name; info.orig_filename = name
+            info.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(info, json.dumps(data).encode() if isinstance(data, (dict, list)) else data)
     return path
 
 
@@ -446,6 +452,72 @@ class RecoveryCatalogTest(unittest.TestCase):
         indexed = c.index_group(group['id'])
         self.assertEqual(indexed['native_archive'], str(portable))
         self.assertNotEqual(indexed['native_archive'], str(archive))
+
+    def test_descriptor_identity_uses_one_api_when_path_stat_differs(self):
+        path = self.root / 'unchanged.bin'; path.write_bytes(b'unchanged')
+        with path.open('rb') as f:
+            actual = os.fstat(f.fileno())
+        differing = SimpleNamespace(st_dev=actual.st_dev + 1, st_ino=actual.st_ino + 99, st_size=actual.st_size,
+                                    st_mtime_ns=actual.st_mtime_ns + 100, st_ctime_ns=actual.st_ctime_ns + 100,
+                                    st_mode=actual.st_mode)
+        with patch.object(Path, 'stat', return_value=differing):
+            expected = archive_io.identity(path)
+            with archive_io.ArchiveReader(path, expected) as reader:
+                self.assertEqual(reader.read(9), b'unchanged')
+        self.assertEqual(expected, [actual.st_dev, actual.st_ino, actual.st_size, actual.st_mtime_ns, actual.st_ctime_ns])
+
+    def test_descriptor_identity_still_rejects_replacement_and_content_changes(self):
+        path = self.root / 'source.bin'; path.write_bytes(b'original')
+        expected = archive_io.identity(path)
+        replacement = self.root / 'replacement.bin'; replacement.write_bytes(b'original')
+        os.replace(replacement, path)
+        self.assertNotEqual(archive_io.identity(path), expected)
+        with self.assertRaisesRegex(ValueError, '改变'): archive_io.ArchiveReader(path, expected)
+        current = archive_io.identity(path); path.write_bytes(b'changed-length')
+        with self.assertRaisesRegex(ValueError, '改变'): archive_io.check_identity(path, current)
+
+    def test_identity_rejects_special_source_before_open_no_fifo_block(self):
+        with patch.object(archive_io.os, 'lstat', return_value=SimpleNamespace(st_mode=stat.S_IFIFO | 0o600)):
+            with patch.object(archive_io.os, 'open') as opened:
+                with self.assertRaisesRegex(ValueError, '普通文件'): archive_io.identity(self.root / 'fifo')
+                opened.assert_not_called()
+
+    def test_explicit_encrypted_reindex_authenticates_same_size_restored_mtime_corruption(self):
+        path = self.enc('session.asmb', {'manifest.json': self.manifest([], 'ai-session-migration-gui-1')})
+        c = self.cat(); group = self.group(c, 'session.asmb'); c.index_group(group['id'])
+        expected = archive_io.identity(path); time_before = path.stat()
+        with path.open('r+b') as f:
+            f.seek(-18, 2); byte = f.read(1); f.seek(-1, 1); f.write(bytes([byte[0] ^ 1]))
+        os.utime(path, ns=(time_before.st_atime_ns, time_before.st_mtime_ns))
+        descriptor = archive_io.descriptor_identity
+        def creation_time_stat(fd):
+            current = descriptor(fd)
+            if current[:2] == expected[:2]: current[-1] = expected[-1]
+            return current
+        # Model Windows creation-time ctime: metadata matches despite mutation.
+        with patch.object(archive_io, 'descriptor_identity', side_effect=creation_time_stat):
+            self.assertTrue(c._source_unchanged(path))
+            with patch.object(archive_io, 'authenticate', wraps=archive_io.authenticate) as authenticate:
+                with self.assertRaisesRegex(ValueError, '认证失败'): c.index_group(group['id'])
+                self.assertTrue(authenticate.called)
+        self.assertNotEqual(next(g for g in c.groups() if g['id'] == group['id'])['status'], 'ready')
+
+    def test_key_group_hash_detects_same_size_restored_mtime_key_edit(self):
+        c = self.cat(); group = next(g for g in c.groups() if g['category'] == 'keys'); c.index_group(group['id'])
+        item = next(r for r in c.list_items(group['id']) if r['kind'] == 'file')
+        original = self.key.read_bytes(); expected = archive_io.identity(self.key); before = self.key.stat()
+        self.assertEqual(item['sha256'], digest(original))
+        key_body = json.loads(original)['key'].encode(); position = original.index(key_body)
+        changed = original[:position] + (b'A' if original[position:position + 1] != b'A' else b'B') + original[position + 1:]
+        self.key.write_bytes(changed); os.utime(self.key, ns=(before.st_atime_ns, before.st_mtime_ns))
+        descriptor = archive_io.descriptor_identity
+        def creation_time_stat(fd):
+            current = descriptor(fd)
+            if current[:2] == expected[:2]: current[-1] = expected[-1]
+            return current
+        with patch.object(archive_io, 'descriptor_identity', side_effect=creation_time_stat):
+            with self.assertRaisesRegex(ValueError, '校验失败'): self.read(c, item)
+        self.assertEqual(len(changed), len(original))
 
     def test_cancellation_does_not_expose_partial_items(self):
         self.enc('sessions.asmb', {'manifest.json': self.manifest([self.entry('x', b'x')]), 'objects/x': b'x'})

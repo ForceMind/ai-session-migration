@@ -68,9 +68,10 @@ def _locations(catalog, target, backup):
 
 
 def _component(value):
-    # Escape '~' as well so encoding is reversible and injective.
+    # Keep already-legal names unchanged. The planner detects any collision
+    # between an escaped name and an existing literal spelling before writing.
     trailing = len(value.rstrip('. '))
-    out = ''.join('~'+format(ord(c),'04X') if c in '~<>:"/\\|?*' or ord(c)<32 or i>=trailing else c for i,c in enumerate(value))
+    out = ''.join('~'+format(ord(c),'04X') if c in '<>:"/\\|?*' or ord(c)<32 or i>=trailing else c for i,c in enumerate(value))
     if out.split('.')[0].upper() in {'CON','PRN','AUX','NUL',*(f'COM{i}' for i in range(1,10)),*(f'LPT{i}' for i in range(1,10))}:
         out = '~005F'+out
     if len(out.encode('utf-8')) > 200:
@@ -162,7 +163,7 @@ def build_file_plan(catalog, item_ids, group_ids, target, backup_root, progress=
                     wanted='directory' if not is_leaf or kind=='directory' else 'file'
                     known=db.execute('SELECT kind FROM destinations WHERE path=?',(key,)).fetchone()
                     if known and (known[0]!='directory' or wanted!='directory'):
-                        raise ValueError('所选项存在同名、大小写或父子路径冲突')
+                        raise ValueError('所选项存在同名、文件名编码、大小写或父子路径冲突')
                     old=db.execute('SELECT path,kind FROM before_files WHERE canonical=?',(key,)).fetchone()
                     if old:
                         if old['path']!=prefix.as_posix() and not is_leaf:raise ValueError('现有目录大小写或Unicode名称冲突')
@@ -233,7 +234,11 @@ def _copy_stream(source, target, expected_size, expected_sha, cancel, progress):
         return digest.hexdigest()
     except BaseException:
         if target.exists() and not _linked(target):
-            current=target.lstat()
+            # Path.stat and fstat expose different identity APIs on Windows.
+            # Compare two opened handles rather than relaxing the ownership check.
+            current_fd=os.open(target,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0))
+            try:current=os.fstat(current_fd)
+            finally:os.close(current_fd)
             if (current.st_dev,current.st_ino)==(owned.st_dev,owned.st_ino):target.unlink()
         raise
 

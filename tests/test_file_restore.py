@@ -1,7 +1,7 @@
 """Recovery boundaries using synthetic payloads and isolated temporary folders."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 import hashlib
 import io
 import json
@@ -130,6 +130,20 @@ class FileRestoreTests(unittest.TestCase):
         self.assertEqual(report['restored'], plan['new'])
         self.assertFalse((self.base / 'escape').exists())
 
+    def test_legal_tilde_name_unchanged_and_encoded_name_collision_blocked(self):
+        legal=self.catalog.add('~valid-module.py',b'original import name')
+        literal=self.catalog.add('name~003Avalue.txt',b'literal spelling')
+        encoded=self.catalog.add('name:value.txt',b'invalid Windows spelling')
+        plan=self.plan([legal,literal,encoded])
+        rows={r['id']:r for r in restore.plan_rows(plan)}
+        self.assertTrue(rows[legal]['path'].replace('\\','/').endswith('/~valid-module.py'))
+        self.assertEqual(rows[literal]['status'],'new')
+        self.assertEqual(rows[encoded]['status'],'blocked')
+        self.assertIn('编码',rows[encoded]['reason'])
+        restore.execute_file_restore(self.catalog,plan)
+        self.assertEqual(Path(rows[legal]['destination']).read_bytes(),b'original import name')
+        self.assertEqual(Path(rows[literal]['destination']).read_bytes(),b'literal spelling')
+
     def test_symlink_descriptor_and_existing_target_link_rejected(self):
         descriptor = b'{"schema":"asm-preserved-symlink-1","target":"/outside","followed":false}\n'
         item = self.catalog.add('shortcut', descriptor, kind='symlink')
@@ -186,7 +200,7 @@ class FileRestoreTests(unittest.TestCase):
             with self.assertRaises(SystemExit): restore.execute_file_restore(self.catalog, plan)
         self.assertEqual(destination.read_bytes(), b'recovered')
         record = json.loads(self.journal().read_text())
-        with sqlite3.connect(plan['database']) as db:
+        with closing(sqlite3.connect(plan['database'])) as db:
             self.assertEqual(db.execute('SELECT phase FROM rows WHERE id=?', (item,)).fetchone()[0], 'publishing')
         checked = restore.check_file_restore(record)
         self.assertEqual(checked['status'], 'complete'); self.assertEqual(checked['checkedPublishedFiles'], 1)

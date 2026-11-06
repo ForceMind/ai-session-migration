@@ -234,9 +234,9 @@ class RecoveryCatalog:
             raise KeyError('旧加密备份需要匹配密钥与认证文件')
         return None, None
 
-    def _ensure_archive(self, path, progress=lambda *_: None, cancel=None):
+    def _ensure_archive(self, path, progress=lambda *_: None, cancel=None, *, force_auth=False):
         path = self._bundle_path(path)
-        if self._source_unchanged(path): return
+        if not force_auth and self._source_unchanged(path): return
         key, authenticated = self._key_for(path, progress, cancel)
         auth = self._resolve(str(path.parent / 'backup-auth.json')) if path.suffix.lower() == '.enc' else None
         expected = authenticated or aio.authenticate(path, key, auth, progress, cancel)
@@ -545,10 +545,18 @@ class RecoveryCatalog:
                         self._bundle_path(p)
                         expected = aio.identity(p)
                         entry = {'file': p.name, 'size': expected[2]}
+                        if group['category'] == 'keys':
+                            entry['sha256'] = hashlib.sha256(aio.bounded_bytes(p, 16384)).hexdigest()
+                            aio.check_identity(p, expected)
                         status = 'unsupported' if p.name.startswith('._') else None
                         self._put(group, entry, {'file': str(p), 'identity': expected}, status=status)
                 else:
-                    for p in paths: self._ensure_archive(p, progress, cancel)
+                    for p in paths:
+                        # Reinterpreting an encrypted manifest requires a fresh
+                        # full authentication. Stat caches cannot prove content
+                        # identity when Windows creation time and restored mtime
+                        # remain unchanged after same-length ciphertext edits.
+                        self._ensure_archive(p, progress, cancel, force_auth=p.suffix.lower() in {'.asmb', '.enc'})
                     for archive in paths:
                         if self._has(archive, 'original-manifest.json') and self._has(archive, 'coverage.json'):
                             group['category'] = 'versions'; self._old_session(group, archive, progress, cancel)
