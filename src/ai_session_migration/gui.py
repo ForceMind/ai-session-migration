@@ -229,7 +229,7 @@ class MainWindow(QMainWindow):
         side.addSpacing(22)
         self.nav_group = QButtonGroup(self)
         self.nav_buttons = {}
-        for name, route in [("▤  会话库", "library"), ("▣  备份库", "backups"), ("⇄  迁移清单", "transfer"), ("↙  导入记录", "imports")]:
+        for name, route in [("▤  会话库", "library"), ("▣  备份库", "backups"), ("↶  恢复中心", "recovery"), ("⇄  迁移清单", "transfer"), ("↙  导入记录", "imports")]:
             b = button(name, lambda _=False, r=route: self.navigate(r))
             b.setObjectName("Nav")
             b.setCheckable(True)
@@ -735,6 +735,11 @@ class MainWindow(QMainWindow):
             self.build_backups()
         elif route == "imports":
             self.build_imports()
+        elif route == "recovery" and "recovery" not in self.pages:
+            from .recovery_gui import RecoveryCenter
+            self.recovery_center = RecoveryCenter(self)
+            self.pages["recovery"] = self.recovery_center
+            self.stack.addWidget(self.recovery_center)
         self.nav_buttons.get(route, self.nav_buttons["library"]).setChecked(True)
         self.stack.setCurrentWidget(self.pages[route])
 
@@ -808,18 +813,27 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "打开备份或迁移包 · 只读预览", "", "备份与迁移包 (*.zip *.asmb *.enc)")
         if not path:
             return
-        key_path = auth_path = None
-        if Path(path).suffix in {".asmb", ".enc"}:
+        self.open_package_path(path)
+
+    def open_package_path(self, path, key_path=None, auth_path=None):
+        """Open an existing package through the same read-only/native import path."""
+        if self.loading or self.busy:
+            self.error("请先等待当前资料任务结束。")
+            return
+        if not Path(path).is_file():
+            self.error("迁移包不可访问，请连接对应磁盘。")
+            return
+        if Path(path).suffix in {".asmb", ".enc"} and not key_path:
             key_path, _ = QFileDialog.getOpenFileName(self, "选择单独保存的恢复密钥", "", "恢复密钥 (*.asmkey *.key);;所有文件 (*)")
             if not key_path:
                 return
-            if Path(path).suffix == ".enc":
-                auth_path = Path(path).parent / "backup-auth.json"
-                if not auth_path.is_file():
-                    auth_name, _ = QFileDialog.getOpenFileName(self, "选择这份旧备份的 backup-auth.json", "", "认证清单 (*.json)")
-                    if not auth_name:
-                        return
-                    auth_path = Path(auth_name)
+        if Path(path).suffix == ".enc" and not auth_path:
+            auth_path = Path(path).parent / "backup-auth.json"
+            if not auth_path.is_file():
+                auth_name, _ = QFileDialog.getOpenFileName(self, "选择这份旧备份的 backup-auth.json", "", "认证清单 (*.json)")
+                if not auth_name:
+                    return
+                auth_path = Path(auth_name)
         self.loading = True
         def load(progress):
             source = decrypt_for_preview(Path(path), Path(key_path), self.state.cache / "decrypted", progress, auth_path) if key_path else Path(path)

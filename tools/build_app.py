@@ -37,7 +37,7 @@ if sys.platform == "darwin":
     app = dist / "AI Session Migration.app"
     info_path = app / "Contents/Info.plist"
     info = plistlib.loads(info_path.read_bytes())
-    info.update(CFBundleShortVersionString="0.2.0", CFBundleVersion="2", CFBundleDisplayName="AI Session Migration", LSMinimumSystemVersion="14.4", NSRequiresAquaSystemAppearance=False, NSHighResolutionCapable=True)
+    info.update(CFBundleShortVersionString="0.3.0", CFBundleVersion="3", CFBundleDisplayName="AI Session Migration", LSMinimumSystemVersion="14.4", NSRequiresAquaSystemAppearance=False, NSHighResolutionCapable=True)
     info_path.write_bytes(plistlib.dumps(info))
     subprocess.run(["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app)], check=True)
 print("Built desktop client for", platform.system(), platform.machine())

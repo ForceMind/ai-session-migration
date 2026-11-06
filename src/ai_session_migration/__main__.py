@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import time
 import io
+import zipfile
 
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QFont, QIcon, QPalette, QColor
@@ -50,6 +51,49 @@ def synthetic_import_acceptance(window):
     return result
 
 
+def synthetic_file_acceptance(window):
+    """Qualify packaged recovery codecs and file recovery on synthetic data only."""
+    from .recovery_catalog import RecoveryCatalog
+    from .file_restore import build_file_plan, plan_rows, execute_file_restore, check_file_restore, rollback_file_restore
+    from .safeio import hash_file
+    from .importer import inventory
+    if window.home.resolve()==Path.home().resolve() or {r.session_id for r in window.records}!={'claude-session','codex-session','harness-session'}:
+        raise ValueError('File recovery acceptance refuses real or unknown sources')
+    base=window.state.root/'synthetic-file-recovery';base.mkdir(mode=0o700)
+    source=base/'source';source.mkdir(mode=0o700)
+    archive=source/'project.zip'
+    with zipfile.ZipFile(archive,'x',zipfile.ZIP_DEFLATED) as z:
+        z.writestr('folder/selected.txt',b'preserved thinking and original bytes')
+        z.writestr('folder/existing.txt',b'source version cannot overwrite existing')
+        z.writestr('not-selected.txt',b'must remain absent')
+    before_source=hash_file(archive)
+    catalog=RecoveryCatalog(source,window.state.cache/'synthetic-file-recovery')
+    try:
+        group=catalog.discover()[0];group=catalog.index_group(group['id'])
+        rows=catalog.list_items(group['id'],limit=200)
+        folder=next(r for r in rows if r['path']=='folder')
+        target=base/'target';target.mkdir(mode=0o700);(target/'keep.txt').write_bytes(b'original target')
+        backup=base/'backups'
+        preliminary=build_file_plan(catalog,[folder['id']],[],target,backup)
+        existing=next(r for r in plan_rows(preliminary,limit=100) if r['path'].replace('\\','/').endswith('/existing.txt'))
+        p=Path(existing['destination']);p.parent.mkdir(parents=True);p.write_bytes(b'existing target remains')
+        before=inventory(target)
+        plan=build_file_plan(catalog,[folder['id']],[],target,backup)
+        report=execute_file_restore(catalog,plan)
+        checked=check_file_restore(report)
+        selected=next(r for r in plan_rows(plan) if r['path'].replace('\\','/').endswith('/selected.txt'))
+        content_ok=Path(selected['destination']).read_bytes()==b'preserved thinking and original bytes'
+        unselected_absent=not any(p.name=='not-selected.txt' for p in target.rglob('*'))
+        rolled=rollback_file_restore(checked)
+        result={'syntheticOnly':True,'backupVerified':report['backupVerified'],'readbackVerified':checked['readbackVerified'],
+                'selectedBytesCorrect':content_ok,'existingPreserved':p.read_bytes()==b'existing target remains',
+                'unselectedAbsent':unselected_absent,'rollbackVerified':rolled['rollbackVerified'] and inventory(target)==before,
+                'sourceUnchanged':hash_file(archive)==before_source,'nativeClientRestored':False}
+        result['ok']=all(result[k] for k in ['backupVerified','readbackVerified','selectedBytesCorrect','existingPreserved','unselectedAbsent','rollbackVerified','sourceUnchanged'])
+        return result
+    finally:catalog.close()
+
+
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     # Internal acceptance hooks; normal users launch the app without arguments.
@@ -59,10 +103,11 @@ def main():
     parser.add_argument("--smoke-screenshot")
     parser.add_argument("--smoke-real", action="store_true")
     parser.add_argument("--smoke-import", action="store_true")
+    parser.add_argument("--smoke-recovery", action="store_true")
     args, _ = parser.parse_known_args()
-    if any([args.smoke_home, args.smoke_state, args.smoke_report, args.smoke_screenshot, args.smoke_real, args.smoke_import]) and os.environ.get("ASM_ACCEPTANCE_TEST") != "1":
+    if any([args.smoke_home, args.smoke_state, args.smoke_report, args.smoke_screenshot, args.smoke_real, args.smoke_import, args.smoke_recovery]) and os.environ.get("ASM_ACCEPTANCE_TEST") != "1":
         raise SystemExit("Internal acceptance hooks are disabled for normal application launches")
-    if args.smoke_import and (not args.smoke_report or not args.smoke_state or not args.smoke_home or args.smoke_real or Path(args.smoke_home).resolve() == Path.home().resolve()):
+    if (args.smoke_import or args.smoke_recovery) and (not args.smoke_report or not args.smoke_state or not args.smoke_home or args.smoke_real or Path(args.smoke_home).resolve() == Path.home().resolve()):
         raise SystemExit("Import acceptance requires isolated synthetic homes and a report")
     if args.smoke_report:
         roots = []
@@ -145,10 +190,16 @@ def main():
                             checks[provider] = {"messages": 0}
                     if args.smoke_import:
                         checks["syntheticImport"] = synthetic_import_acceptance(window)
+                    if args.smoke_recovery:
+                        checks['syntheticRecovery']=synthetic_file_acceptance(window)
                     return checks
                 def read_done(checks):
                     if "syntheticImport" in checks:
                         result["syntheticImport"] = checks.pop("syntheticImport")
+                    if 'syntheticRecovery' in checks:
+                        result['syntheticRecovery']=checks.pop('syntheticRecovery')
+                        window.navigate('recovery')
+                        result['recoveryWidgetCreated']='recovery' in window.pages
                     result["readChecks"] = checks
                     state["read_done"] = True
                 def read_failed(error):
@@ -162,6 +213,8 @@ def main():
             result["ok"] = not state["read_error"] and all(result.get("readChecks", {}).get(p, {}).get("messages", 0) > 0 for p in ["claude", "codex", "deepseek"])
             if args.smoke_import:
                 result["ok"] = result["ok"] and result.get("syntheticImport", {}).get("ok", False)
+            if args.smoke_recovery:
+                result['ok']=result['ok'] and result.get('syntheticRecovery',{}).get('ok',False) and result.get('recoveryWidgetCreated',False)
             if args.smoke_screenshot:
                 # Only synthetic fixtures may be captured for sharable screenshots.
                 if real_data:
