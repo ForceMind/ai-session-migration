@@ -19,3 +19,5 @@ Cloudflare Pages 项目为 `ai-session-migration`，生产分支 `main`。仅上
 0.3.0 本轮已上线并独立回读：生产部署 `f5afca75-848c-4536-81a7-8c4bef0db919`，部署地址 https://f5afca75.ai-session-migration.pages.dev ，生产分支main，资源提交 `f0b42acc61ba44f7263a5ac7e9dfc970ea7efedd`。7个生产资源与本地字节一致，安全响应头通过，4个公开下载入口HTTP可用且资产服务端摘要与已验收文件一致；通用说明及校验清单已实际下载逐字节比对。主分支[集成CI](https://github.com/ForceMind/ai-session-migration/actions/runs/42216621333)通过；应用源码与已验收构建8aecbd0一致，未重新编译或替换发布安装包。浏览器未验证。
 
 2026-11-12，官网新增首次从移动硬盘恢复的四步说明。公开下载对应 0.3.0，页面指向侧栏「恢复中心」。生产部署 https://c8ca1c4c.ai-session-migration.pages.dev 对应站点提交 `211216ebf35341d1ccb1852921c9c9772da3398f`。生产地址的 7 个静态资源与本地字节一致，Mac 和 Windows 下载均可访问。浏览器未验证。
+
+官网 0.3.0 下载区新增 GH-Proxy 国内加速入口。Mac、Windows、图形说明和 SHA-256 清单均保留 GitHub 原链接，并各有代理链接。代理链接使用 `https://gh-proxy.org/` 加完整下载地址。Mac 和两个文本文件完整下载校验通过。Windows 单次下载超时后，分四段逐字节核对全部内容。部署地址 https://1f3e552e.ai-session-migration.pages.dev 对应站点提交 `3d5f0f0edce0d8d3129814864c10b8e7b36d35c7`，正式域名的 7 个静态资源已逐字节回读。浏览器未验证。
