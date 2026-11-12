@@ -59,7 +59,22 @@
       <ol class="steps"><li><span class="step-number">01</span><h3>识别与选择</h3><p>在原电脑识别本地资料，查看历史与附件，选择需要带走的会话。</p><span class="step-action">识别本机资料</span></li><li><span class="step-number">02</span><h3>备份与导出</h3><p>通过向导生成加密保全备份和迁移包，单独保存恢复密钥，检查校验结果。</p><span class="step-action">新建备份</span></li><li><span class="step-number">03</span><h3>选择与预览</h3><p>在恢复中心勾选文件或目录；会话进入原生导入向导，映射项目并查看冲突。</p><span class="step-action">恢复中心</span></li><li><span class="step-number">04</span><h3>备份目标，再恢复</h3><p>先完整备份目标资料并回读校验，在独立副本恢复后发布，保留恢复记录。</p><span class="step-action">备份目标并导入</span></li></ol>
     </section>
 
-    <section class="care section" id="recovery" aria-labelledby="recovery-title"><div class="wrap care-grid"><div class="care-intro"><p class="eyebrow">CHOOSE WHAT COMES BACK.</p><h2 id="recovery-title">每份资料，<br>由你选择恢复。</h2><p>打开备份总目录，分清会话、项目文件、应用资料与历史版本。先看清范围，再选择目标。</p><a class="text-link" href="https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/GUI-0.3.0-Guide.txt">查看图形操作说明 <span aria-hidden="true">↗</span></a></div><div class="care-list"><article><span aria-hidden="true">▤</span><div><h3>归档统一查看</h3><p>支持完整分卷、会话与项目 ZIP、原生数据库补充、历史差异、快照和密钥目录。大目录分页显示，未知或缺失项标明原因。</p></div></article><article><span aria-hidden="true">✓</span><div><h3>选文件，也能选整组</h3><p>按单项、文件夹或整组勾选。整组包含全部分页；原生会话可进入会话库逐条选择导入。</p></div></article><article><span aria-hidden="true">↶</span><div><h3>先保护目标，再写入</h3><p>先预览新增、跳过和阻止，完整备份并回读目标。已有文件不覆盖；撤销只处理本次创建且未被用户改动的文件。</p></div></article><article><span aria-hidden="true">⌁</span><div><h3>大备份不挤满系统盘</h3><p>图形界面可选择缓存位置，索引空间不足会停止。加密归档认证后按需读取，密钥正文不显示。</p></div></article></div></div></section>
+    <section class="care section" id="recovery" aria-labelledby="recovery-title">
+      <div class="wrap care-grid">
+        <div class="care-intro">
+          <h2 id="recovery-title">第一次从移动硬盘恢复</h2>
+          <p>接上移动硬盘，启动客户端，从侧栏进入「恢复中心」。大型备份可以先在「缓存设置…」中选择空间充足的目录。</p>
+          <a class="text-link" href="https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/GUI-0.3.0-Guide.txt">下载完整图形操作说明 <span aria-hidden="true">↗</span></a>
+        </div>
+        <ol class="care-list recovery-steps">
+          <li><article><span aria-hidden="true">1</span><div><h3>选择备份总目录</h3><p>点「选择备份目录」，在移动硬盘上选包含备份批次和「恢复密钥」的那一层。选好后会自动读取目录。</p></div></article></li>
+          <li><article><span aria-hidden="true">2</span><div><h3>勾选要恢复的资料</h3><p>先选左侧备份组，再点「索引当前组」。在列表勾选文件或文件夹，或者勾选整组。整组包含全部分页。</p></div></article></li>
+          <li><article><span aria-hidden="true">3</span><div><h3>选择目标并预览</h3><p>选文件恢复的目标位置和独立的目标备份位置，再点「预览文件恢复计划」。先核对新增、跳过和阻止项。</p></div></article></li>
+          <li><article><span aria-hidden="true">4</span><div><h3>备份目标并恢复</h3><p>核对目标备份位置，确认提示后点「备份目标并恢复文件副本」。已有文件会跳过，结果可在恢复记录中查看。</p></div></article></li>
+        </ol>
+      </div>
+      <div class="wrap validation-note"><span class="note-symbol" aria-hidden="true">i</span><p>想在原客户端打开会话时，选会话组并点「打开原生会话选择…」，再按导入向导操作。项目文件、Mac 应用资料和数据库可恢复为文件副本。</p></div>
+    </section>
 
     <section class="care section" aria-labelledby="care-title"><div class="wrap care-grid"><div class="care-intro"><p class="eyebrow">YOUR HISTORY STAYS YOURS.</p><h2 id="care-title">带走历史，<br>保留原来的样子。</h2><p>会话里有正文，也有工具记录、附件和项目关系。迁移时，这些细节同样重要。</p><a class="text-link" href="https://github.com/ForceMind/ai-session-migration/blob/main/README.md" target="_blank" rel="noopener noreferrer">阅读完整支持说明 <span aria-hidden="true">↗</span></a></div><div class="care-list"><article><span aria-hidden="true">↗</span><div><h3>原会话与 thinking 保留</h3><p>读取使用私有快照。源资料不改写，历史中的命令和工具调用只展示，不执行。</p></div></article><article><span aria-hidden="true">⊞</span><div><h3>已有对话，留在原位</h3><p>同 ID 会话默认跳过。先看冲突，再决定范围，不自动覆盖或合并目标历史。</p></div></article><article><span aria-hidden="true">↶</span><div><h3>出问题，也有回去的路</h3><p>保留完整目标备份、原目录和恢复日志。支持条件撤销；已有新对话时停止自动恢复。</p></div></article><article><span aria-hidden="true">⌁</span><div><h3>每份结果，都实际校验</h3><p>逐文件核对 SHA-256，加密备份做解密回读。遗漏、失败与待验证项分别显示。</p></div></article></div></div></section>
 
