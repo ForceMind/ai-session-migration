@@ -64,7 +64,10 @@
         <div class="care-intro">
           <h2 id="recovery-title">第一次从移动硬盘恢复</h2>
           <p>接上移动硬盘，启动客户端，从侧栏进入「恢复中心」。大型备份可以先在「缓存设置…」中选择空间充足的目录。</p>
-          <a class="text-link" href="https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/GUI-0.3.0-Guide.txt">下载完整图形操作说明 <span aria-hidden="true">↗</span></a>
+          <div class="recovery-guide-links">
+            <a class="text-link" href="https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/GUI-0.3.0-Guide.txt">下载完整图形操作说明 <span aria-hidden="true">↗</span></a>
+            <a class="text-link" href="https://gh-proxy.org/https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/GUI-0.3.0-Guide.txt" rel="noreferrer" aria-label="国内加速下载图形操作说明">国内加速</a>
+          </div>
         </div>
         <ol class="care-list recovery-steps">
           <li><article><span aria-hidden="true">1</span><div><h3>选择备份总目录</h3><p>点「选择备份目录」，在移动硬盘上选包含备份批次和「恢复密钥」的那一层。选好后会自动读取目录。</p></div></article></li>
@@ -80,7 +83,42 @@
 
     <section class="support wrap section" id="support" aria-labelledby="support-title"><div class="section-heading"><div><p class="eyebrow">KNOW WHAT COMES WITH YOU.</p><h2 id="support-title">支持什么，写清楚。</h2></div><a class="text-link" href="https://github.com/ForceMind/ai-session-migration/actions/runs/42198293965" target="_blank" rel="noopener noreferrer">104 项合成检查通过 <span aria-hidden="true">↗</span></a></div><div class="table-scroll"><table><caption class="sr-only">0.3.0 会话来源与恢复边界</caption><thead><tr><th scope="col">会话来源</th><th scope="col">可查看与保全</th><th scope="col">原生恢复边界</th></tr></thead><tbody><tr><th scope="row"><i class="provider-mark claude" aria-hidden="true">C</i>Claude Code</th><td>本地项目日志、工具记录和附件；可用的 Desktop Code 索引。</td><td>恢复 Code 本地日志；Desktop 索引需选择目标账号的索引目录。普通云端聊天不在此接口范围内。</td></tr><tr><th scope="row"><i class="provider-mark codex" aria-hidden="true">⌘</i>Codex</th><td>原生索引、分页历史、可用 rollout、附件与项目关系。</td><td>目标需先初始化相容数据库。同 ID 跳过；独立 SQLite 目录配置暂不跨目录替换。</td></tr><tr><th scope="row"><i class="provider-mark deepseek" aria-hidden="true">D</i>DeepSeek Harness</th><td>原始日志、附件、项目归属、归档与置顶。</td><td>支持活动 v4 日志与 workspace v2。未知格式明确阻止；显示缓存由原客户端重建。</td></tr></tbody></table></div><div class="validation-note"><span class="note-symbol" aria-hidden="true">i</span><p><strong>先区分资料恢复与真实续聊。</strong> 104 项测试在本地、Linux 和 Windows 通过，两平台打包程序已通过合成资料导入与文件选择恢复检查。Mac 应用资料和数据库可提取为副本，不等于 Windows 原生运行环境或登录已恢复。个人 Windows 资料导入、原客户端显示、跨账号 / 组织 / 供应商兼容及真实续聊，仍需在目标电脑验证。</p></div></section>
 
-    <section class="download section" id="download" aria-labelledby="download-title"><div class="wrap"><div class="download-heading"><p class="eyebrow">TAKE THE NEXT CHAPTER WITH YOU.</p><h2 id="download-title">下一台电脑，也有这段上下文。</h2><p>下载 0.3.0 预览版，双击打开。所有操作都在图形界面中完成。</p></div><div class="download-options"><article class="download-card"><span class="os-label">MAC</span><h3>macOS</h3><p>Apple Silicon · macOS 14.4 或更高版本</p><a class="button primary download-mac" href="https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/AI-Session-Migration-0.3.0-mac-arm64.dmg">下载 Mac 客户端 <span aria-hidden="true">↓</span></a><div class="download-meta"><span>DMG · 37.2 MiB</span><span>0.3.0</span></div><small>本地临时签名，尚未 Apple 公证。</small></article><article class="download-card"><span class="os-label">WINDOWS</span><h3>Windows</h3><p>x64 · 完整解压后双击 EXE</p><a class="button download-windows" href="https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/AI-Session-Migration-0.3.0-Windows-x64.zip">下载 Windows 客户端 <span aria-hidden="true">↓</span></a><div class="download-meta"><span>ZIP · 45.4 MiB</span><span>0.3.0</span></div><small>保留 _internal 文件夹；无可信发布签名。</small></article></div><div class="download-links"><a href="https://github.com/ForceMind/ai-session-migration/releases/tag/v0.3.0">版本说明 <span aria-hidden="true">↗</span></a><a href="https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/GUI-0.3.0-Guide.txt">图形操作说明 <span aria-hidden="true">↗</span></a><a href="https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/SHA256SUMS.txt">SHA-256 校验值 <span aria-hidden="true">↗</span></a><a href="https://github.com/ForceMind/ai-session-migration">查看源码 <span aria-hidden="true">↗</span></a></div></div></section>
+    <section class="download section" id="download" aria-labelledby="download-title">
+      <div class="wrap">
+        <div class="download-heading">
+          <p class="eyebrow">TAKE THE NEXT CHAPTER WITH YOU.</p>
+          <h2 id="download-title">下一台电脑，也有这段上下文。</h2>
+          <p>下载 0.3.0 预览版，双击打开。所有操作都在图形界面中完成。</p>
+        </div>
+        <div class="download-options">
+          <article class="download-card">
+            <span class="os-label">MAC</span>
+            <h3>macOS</h3>
+            <p>Apple Silicon · macOS 14.4 或更高版本</p>
+            <a class="button primary download-mac" href="https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/AI-Session-Migration-0.3.0-mac-arm64.dmg">下载 Mac 客户端 <span aria-hidden="true">↓</span></a>
+            <a class="text-link download-proxy" href="https://gh-proxy.org/https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/AI-Session-Migration-0.3.0-mac-arm64.dmg" rel="noreferrer" aria-label="国内加速下载 Mac 客户端">国内加速 <span aria-hidden="true">↗</span></a>
+            <div class="download-meta"><span>DMG · 37.2 MiB</span><span>0.3.0</span></div>
+            <small>本地临时签名，尚未 Apple 公证。</small>
+          </article>
+          <article class="download-card">
+            <span class="os-label">WINDOWS</span>
+            <h3>Windows</h3>
+            <p>x64 · 完整解压后双击 EXE</p>
+            <a class="button download-windows" href="https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/AI-Session-Migration-0.3.0-Windows-x64.zip">下载 Windows 客户端 <span aria-hidden="true">↓</span></a>
+            <a class="text-link download-proxy" href="https://gh-proxy.org/https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/AI-Session-Migration-0.3.0-Windows-x64.zip" rel="noreferrer" aria-label="国内加速下载 Windows 客户端">国内加速 <span aria-hidden="true">↗</span></a>
+            <div class="download-meta"><span>ZIP · 45.4 MiB</span><span>0.3.0</span></div>
+            <small>保留 _internal 文件夹；无可信发布签名。</small>
+          </article>
+        </div>
+        <p class="download-proxy-note">国内加速由第三方 GH-Proxy 提供。下载后可用 GitHub 发布的 SHA-256 校验值核对文件。</p>
+        <div class="download-links">
+          <a href="https://github.com/ForceMind/ai-session-migration/releases/tag/v0.3.0">版本说明 <span aria-hidden="true">↗</span></a>
+          <span class="download-link-pair"><a href="https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/GUI-0.3.0-Guide.txt">图形操作说明 <span aria-hidden="true">↗</span></a><a href="https://gh-proxy.org/https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/GUI-0.3.0-Guide.txt" rel="noreferrer" aria-label="国内加速下载图形操作说明">国内加速</a></span>
+          <span class="download-link-pair"><a href="https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/SHA256SUMS.txt">SHA-256 校验值 <span aria-hidden="true">↗</span></a><a href="https://gh-proxy.org/https://github.com/ForceMind/ai-session-migration/releases/download/v0.3.0/SHA256SUMS.txt" rel="noreferrer" aria-label="国内加速下载 SHA-256 校验值">国内加速</a></span>
+          <a href="https://github.com/ForceMind/ai-session-migration">查看源码 <span aria-hidden="true">↗</span></a>
+        </div>
+      </div>
+    </section>
 
     <section class="faq wrap section" id="faq" aria-labelledby="faq-title"><div><p class="eyebrow">A FEW THINGS TO KNOW.</p><h2 id="faq-title">开始前，了解这些。</h2><p>遇到不确定的格式或冲突，<br>先保全资料，再确认下一步。</p></div><div class="questions"><details><summary>需要安装 Python，或者输入命令吗？<span aria-hidden="true">+</span></summary><p>不需要。客户端内置运行环境。Mac 打开 DMG 中的应用；Windows 完整解压 ZIP，保留 _internal，再双击 AI Session Migration.exe。备份、校验、冲突预览与导入都通过窗口完成。</p></details><details><summary>会把我的对话上传到网站吗？<span aria-hidden="true">+</span></summary><p>不会。网站仅介绍软件和提供下载入口，不扫描本机资料，也没有会话上传功能。客户端在本地读取和处理资料；私密备份、附件与恢复密钥由你保管。</p></details><details><summary>备份时必须退出原客户端吗？<span aria-hidden="true">+</span></summary><p>在线备份可以保持原客户端运行，但它是按文件和数据库分别取得的快照，不代表跨文件同一时刻。遗漏与来源变化会记录。向目标原客户端导入时，需要先正常退出它及相关后台任务。</p></details><details><summary>迁移包和备份都加密了吗？<span aria-hidden="true">+</span></summary><p>会话保全 ASMB 使用加密保护，恢复密钥需单独保存。Windows 会话迁移 ZIP、项目文件 ZIP 和导入/恢复前的目标备份未加密，仍可能包含私密历史、附件或目标机凭据，请保存在私密位置。</p></details><details><summary>不同账号或组织之间，可以直接续聊吗？<span aria-hidden="true">+</span></summary><p>可以选择目标自己的资料目录和 Desktop Code 索引容器，工具不搬运源登录材料。资料恢复、原客户端显示与模型是否接受这段历史是不同的检查，跨账号、组织、供应商的真实续聊需要在目标电脑单独验证。</p></details><details><summary>导入会覆盖已有对话吗？能撤销吗？<span aria-hidden="true">+</span></summary><p>同 ID 会话默认跳过。发布前先完整备份目标目录，并在独立副本恢复和核验。若目标仍与导入结果一致，可以条件撤销；已有新对话时会拒绝自动撤销。异常退出可从“导入记录”打开备份目录中的恢复记录。</p></details><details><summary>项目代码、登录信息和旧任务也会恢复吗？<span aria-hidden="true">+</span></summary><p>恢复中心可勾选项目代码、应用资料和旧版本，恢复为独立文件副本；Mac 专用资料不保证直接用于 Windows。原生会话导入仅映射项目归属，目标工作文件可先通过恢复中心准备。源登录、远程连接、Goals、队列和执行配置不随会话导入；历史命令不执行，原正文和 thinking 保留。</p></details></div></section>
   </main>

@@ -15,3 +15,20 @@
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{transition:none!important}}
 
 .recovery-steps{list-style:none;padding-inline-start:0;margin:0}.recovery-steps li+li{border-top:1px solid #303a34;margin-top:24px;padding-top:24px}.recovery-steps article{margin:0}
+
+.recovery-guide-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  margin-top: 32px;
+}
+.care-intro .recovery-guide-links .text-link { margin-top: 0; }
+.download-card .download-proxy { margin-top: 12px; }
+.download-proxy-note {
+  margin-top: 18px;
+  text-align: center;
+  color: #a6b8ac;
+  font-size: 12px;
+}
+.download-links { flex-wrap: wrap; row-gap: 12px; }
+.download-link-pair { display: inline-flex; flex-wrap: wrap; gap: 10px; }
