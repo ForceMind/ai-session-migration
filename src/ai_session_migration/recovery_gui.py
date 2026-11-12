@@ -114,14 +114,15 @@ class RecoveryCenter(QWidget):
         self.cache_button = action("缓存设置…", self.cache_settings)
         heading.addWidget(self.cache_button)
         layout.addLayout(heading)
-        layout.addWidget(text_label("浏览所有备份，按文件、文件夹或整组恢复到独立目录；源备份保持不变。", "Subheading"))
+        self.guide = text_label("", "Subheading")
+        layout.addWidget(self.guide)
         self.cache_note = text_label("", "Muted")
         self.refresh_cache_note()
         layout.addWidget(self.cache_note)
         row = QHBoxLayout()
         self.root_field = QLineEdit()
         self.root_field.setPlaceholderText("选择迁移备份总目录，或其中一个备份目录")
-        self.root_field.textEdited.connect(self.invalidate_plan)
+        self.root_field.textChanged.connect(self.invalidate_plan)
         row.addWidget(self.root_field, 1)
         self.root_button = action("选择备份目录", self.choose_root)
         self.load_button = action("读取目录", self.load_root, True)
@@ -228,6 +229,7 @@ class RecoveryCenter(QWidget):
         self.cancel_button = action("取消当前任务", self.cancel_task)
         progress_row.addWidget(self.stage, 1); progress_row.addWidget(self.progress); progress_row.addWidget(self.cancel_button)
         layout.addLayout(progress_row)
+        self.tabs.currentChanged.connect(self.update_guidance)
         self.update_controls()
 
     def run_task(self, fn, done, stage, cancellable=True):
@@ -284,7 +286,7 @@ class RecoveryCenter(QWidget):
             widget.setEnabled(idle)
         current = self.current_group or {}
         self.index_button.setEnabled(idle and bool(current) and self.source_matches())
-        self.native_button.setEnabled(idle and bool(current.get("native_archive")))
+        self.native_button.setEnabled(idle and self.source_matches() and bool(current.get("native_archive")))
         self.previous.setEnabled(idle and self.offset > 0)
         self.next.setEnabled(idle and self.offset + self.PAGE_SIZE < self.total)
         self.preview_button.setEnabled(idle and bool(self.catalog) and self.source_matches() and bool(self.selected_items or self.selected_groups))
@@ -294,6 +296,44 @@ class RecoveryCenter(QWidget):
         self.plan_next.setEnabled(idle and bool(self.plan) and self.plan_offset + self.PAGE_SIZE < int((self.plan or {}).get("selected", 0)))
         for widget in (self.check_record_button, self.open_record_button, self.rollback_button):
             widget.setEnabled(idle and self.record_list.currentItem() is not None)
+        self.update_guidance()
+
+    def update_guidance(self, *_):
+        if self.busy:
+            return
+        if self.tabs.currentIndex() == 2:
+            hint = "查看恢复结果\n选择一条记录，检查已恢复文件、目标备份和跳过原因。"
+        elif not self.source_matches() or not self.groups:
+            hint = (
+                "第 1 步 · 选择备份目录\n"
+                "在移动硬盘上选包含备份批次和「恢复密钥」的那一层。点「选择备份目录」后会自动读取。"
+            )
+        elif self.plan:
+            hint = (
+                "第 4 步 · 核对预览并恢复\n"
+                "检查新增、跳过和阻止项。确认目标备份位置后，点「备份目标并恢复文件副本」。"
+                if self.plan.get("new") else
+                "第 4 步 · 查看跳过和阻止项\n"
+                "当前计划没有新增项。可回到「备份与选择」调整资料或目标位置。"
+            )
+            if self.tabs.currentIndex() == 0:
+                hint += " 在「冲突预览与执行」中查看计划。"
+        elif self.selected_items or self.selected_groups:
+            hint = (
+                "第 3 步 · 选择保存位置并预览\n"
+                "分别选择文件恢复的目标位置和目标备份位置，再点「预览文件恢复计划」。"
+            )
+            if self.tabs.currentIndex() == 1:
+                hint += " 请先回到「备份与选择」。"
+        else:
+            hint = (
+                "第 2 步 · 勾选要恢复的资料\n"
+                "选左侧备份组，点「索引当前组」，再勾选文件或文件夹。勾选左侧整组会包含所有分页。"
+                " 会话导入请点「打开原生会话选择…」。"
+            )
+            if (self.current_group or {}).get("status") == "key-required":
+                hint = "第 2 步 · 解锁备份\n点「选择恢复密钥…」，选择与当前备份配套的密钥，再索引当前组。"
+        self.guide.setText(hint)
 
     def refresh_cache_note(self):
         self.cache_note.setText(f"大型备份的目录索引使用缓存；内置磁盘空间不足时，可在缓存设置中选择移动磁盘。当前：{self.owner.state.cache}")
@@ -344,6 +384,7 @@ class RecoveryCenter(QWidget):
                 old.close()
             self.clear_selected(); self.current_group = None
             self.items.clear(); self.total = self.offset = 0
+            self.tabs.setCurrentIndex(0)
             self.fill_groups()
             self.stage.setText(f"已识别 {len(self.groups)} 组备份" if self.groups else "目录内没有可识别备份；源文件保持不变。")
         self.run_task(work, done, "正在发现备份分类")
@@ -631,6 +672,9 @@ class RecoveryCenter(QWidget):
         self.run_task(lambda progress: rollback_file_restore(report, progress=progress), self.save_report, "正在核验日志并安全回滚", cancellable=False)
 
     def open_native(self):
+        if not self.source_matches():
+            self.show_error("备份目录已变化，请先点击读取目录。")
+            return
         group = self.current_group or {}
         path = group.get("native_archive")
         if not path:

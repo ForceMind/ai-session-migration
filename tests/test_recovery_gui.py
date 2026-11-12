@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPushButton
 from ai_session_migration.gui import MainWindow
 from ai_session_migration.recovery_gui import RecoveryCenter
 
@@ -124,6 +124,7 @@ class RecoveryGuiTest(unittest.TestCase):
     def test_preview_ack_gate_invalidation_restore_and_saved_record(self):
         self.choose_project()
         self.page.items.item(1).setCheckState(Qt.CheckState.Checked)
+        self.assertIn("第 3 步", self.page.guide.text())
         self.page.target.setText(str(self.base / 'target'))
         self.page.backup.setText(str(self.base / 'target-backups'))
         calls = []
@@ -146,6 +147,7 @@ class RecoveryGuiTest(unittest.TestCase):
         with patch.dict('sys.modules', {'ai_session_migration.file_restore': api}):
             self.page.preview(); self.wait_tasks()
             self.assertEqual(self.page.plan_list.count(), 3)
+            self.assertIn("第 4 步", self.page.guide.text())
             self.assertFalse(self.page.restore_button.isEnabled())
             self.page.restore()
             self.assertEqual(len(calls), 1)
@@ -154,12 +156,14 @@ class RecoveryGuiTest(unittest.TestCase):
             self.page.target.setText(str(self.base / 'other-target'))
             self.assertIsNone(self.page.plan)
             self.assertFalse(self.page.ack.isChecked())
+            self.assertIn("第 3 步", self.page.guide.text())
             self.page.preview(); self.wait_tasks()
             self.page.ack.setChecked(True); self.page.restore(); self.wait_tasks()
             self.page.check_record(); self.wait_tasks()
         self.assertEqual(calls[-1], ('execute',))
         self.assertEqual(len(self.owner.state.data['fileRestores']), 1)
         self.assertEqual(self.page.tabs.currentIndex(), 2)
+        self.assertIn("查看恢复结果", self.page.guide.text())
         self.assertIn('记录检查完成', self.page.log.toPlainText())
         self.assertIn('原生客户端恢复：未执行', self.page.record_details.toPlainText())
 
@@ -247,9 +251,18 @@ class RecoveryGuiTest(unittest.TestCase):
         with zipfile.ZipFile(bundle / 'project.zip', 'w') as archive:
             archive.writestr('folder/', '')
             archive.writestr('folder/file.txt', 'generic source-preserving fixture')
-        self.owner.navigate('recovery')
+        welcome = self.owner.pages['welcome']
+        entry = next(button for button in welcome.findChildren(QPushButton)
+                     if button.text() == '从移动硬盘恢复')
+        entry.click()
         real = self.owner.recovery_center
-        real.root_field.setText(str(bundle)); real.load_root(); self.wait_tasks()
+        self.assertIs(self.owner.stack.currentWidget(), real)
+        self.assertIn('第 1 步', real.guide.text())
+        self.assertIn('恢复密钥', real.guide.text())
+        with patch('ai_session_migration.recovery_gui.QFileDialog.getExistingDirectory', return_value=str(bundle)):
+            real.root_button.click()
+        self.wait_tasks()
+        self.assertIn('第 2 步', real.guide.text())
         self.assertTrue(real.groups)
         group = next(g for g in real.groups if g['category'] == 'projects')
         for i in range(real.group_list.count()):
