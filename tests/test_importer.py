@@ -14,7 +14,8 @@ import zstandard
 
 from ai_session_migration.adapters import LocalLibrary
 from ai_session_migration.backup import make_backup, save_recovery_key, Cancelled
-from ai_session_migration.importer import build_plan, execute_import, rollback_import, inventory, dsh_project_key, target_locks
+from ai_session_migration.importer import (build_plan, execute_import, rollback_import, inventory, dsh_project_key,
+    preview_codex_sidebar, repair_codex_sidebar, target_locks)
 from ai_session_migration.packages import PackageLibrary
 from ai_session_migration.safeio import open_lines, hash_file
 from fixtures import make_home
@@ -109,6 +110,74 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(raised.exception.report['status'], 'rolled-back')
         self.assertTrue(Path(raised.exception.report['backup']).is_file())
         self.assert_original_targets()
+
+    def test_native_import_preserves_independent_and_ungrouped_sessions(self):
+        for home in (self.source, self.target):
+            with closing(sqlite3.connect(home / '.codex/state_5.sqlite')) as c, c:
+                c.execute("ALTER TABLE threads ADD COLUMN project_id TEXT")
+        source_side = self.source / '.codex/.codex-global-state.json'
+        source_side.write_text(json.dumps({'projectless-thread-ids': ['codex-session'], 'source-private': 'never migrate'}))
+        target_side = self.target / '.codex/.codex-global-state.json'
+        target_side.write_text(json.dumps({'projectless-thread-ids': ['existing-codex'], 'setting': {'keep': 1}}))
+        registry = self.source / '.dsh/storages/workspace.json'
+        source_state = json.loads(registry.read_text())
+        source_state['tables']['workspaces']['project']['sessionIds'] = []
+        source_state['global']['pinnedSessionIds'] = ['harness-session']
+        registry.write_text(json.dumps(source_state))
+        records = self.library.scan().records
+        exported = make_backup(self.library, records, self.base / 'second-export', self.base / 'key.asmkey')
+        package = PackageLibrary(Path(exported['portable']), self.base / 'cache')
+        selected = package.scan().records
+        desktop = self.base / 'desktop-index'
+        desktop.mkdir()
+        targets = {**self.targets, 'claude_desktop': str(desktop)}
+        codex = next(r for r in selected if r.provider == 'codex')
+        self.assertTrue(codex.metadata['codex_projectless'])
+        mapping = dict(self.mappings)
+        mapping.pop(codex.cwd)
+        plan = build_plan(package, selected, targets, mapping, self.base / 'cache',
+                          codex_projectless_cwd=self.mappings[codex.cwd])
+        # The Claude fixture shares the source cwd. Keep its normal mapping.
+        blocked = [i['record']['provider'] for i in plan.items if i['action'] == 'blocked']
+        self.assertNotIn('codex', blocked)
+        plan = build_plan(package, selected, targets, self.mappings, self.base / 'cache')
+        self.assertEqual(len(plan.ready), 3)
+        self.assertNotIn('claude_desktop', plan.targets)
+        self.assertTrue(any('包内没有 Desktop 索引' in i['reason'] for i in plan.ready))
+        report = self.execute(plan)
+        self.assertTrue(report['targetReadbackVerified'])
+        self.assertEqual(json.loads(target_side.read_text()), {'projectless-thread-ids': ['existing-codex', 'codex-session'], 'setting': {'keep': 1}})
+        target_registry = json.loads((self.target / '.dsh/storages/workspace.json').read_text())
+        self.assertFalse(any('harness-session' in r['sessionIds'] for r in target_registry['tables']['workspaces'].values()))
+        self.assertIn('harness-session', target_registry['global']['archivedSessionIds'])
+        self.assertIn('harness-session', target_registry['global']['pinnedSessionIds'])
+        self.assertEqual(list(desktop.iterdir()), [])
+
+    def test_sidebar_repair_checks_existing_native_rows_and_preserves_target(self):
+        root = self.target / '.codex'
+        state = root / 'state_5.sqlite'
+        with closing(sqlite3.connect(state)) as c, c:
+            c.execute("ALTER TABLE threads ADD COLUMN project_id TEXT")
+            c.execute("INSERT INTO threads SELECT 'has-project',title,name,cwd,source,updated_at,archived,rollout_path,history_mode,model_provider,is_pinned,'registered' FROM threads WHERE id='existing-codex'")
+        sidebar = root / '.codex-global-state.json'
+        sidebar.write_text(json.dumps({'projectless-thread-ids': ['preserve'], 'other': {'keep': True}}))
+        original = sidebar.read_bytes()
+        before_hash = hash_file(state)
+        with patch('ai_session_migration.importer.native_processes', return_value=[]):
+            plan = preview_codex_sidebar(root, self.base / 'cache', ['existing-codex', 'has-project', 'missing'])
+            self.assertEqual([r['status'] for r in plan.rows], ['可补登记', '已有项目归属', '目标未找到记录'])
+            self.assertEqual(sidebar.read_bytes(), original)
+            with self.assertRaisesRegex(ValueError, '勾选可补登记'):
+                repair_codex_sidebar(plan, ['has-project'], self.base / 'sidebar-backups', self.base / 'cache', confirmed_offline=True)
+            sidebar.write_bytes(original + b' ')
+            with self.assertRaisesRegex(ValueError, '已变化'):
+                repair_codex_sidebar(plan, ['existing-codex'], self.base / 'sidebar-backups', self.base / 'cache', confirmed_offline=True)
+            sidebar.write_bytes(original)
+            result = repair_codex_sidebar(plan, ['existing-codex'], self.base / 'sidebar-backups', self.base / 'cache', confirmed_offline=True)
+            self.assertEqual(Path(result['backup'], sidebar.name).read_bytes(), original)
+            self.assertEqual(preview_codex_sidebar(root, self.base / 'cache', ['existing-codex']).rows[0]['status'], '已登记')
+        self.assertEqual(hash_file(state), before_hash)
+        self.assertEqual(json.loads(sidebar.read_text()), {'projectless-thread-ids': ['preserve', 'existing-codex'], 'other': {'keep': True}})
 
     def test_abrupt_process_exit_is_recoverable_from_persisted_journal(self):
         plan = self.plan()

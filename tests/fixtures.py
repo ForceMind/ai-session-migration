@@ -82,3 +82,23 @@ def make_import_target(home: Path):
     registry = home / '.dsh/storages/workspace.json'
     registry.write_text(registry.read_text().replace('harness-session', 'existing-harness'))
     return files
+
+
+def make_packaged_import_fixture(home: Path, target: Path):
+    make_home(home)
+    make_import_target(target)
+    for root in (home, target):
+        with closing(sqlite3.connect(root / ".codex/state_5.sqlite")) as db, db:
+            db.execute("ALTER TABLE threads ADD COLUMN project_id TEXT")
+    (home / ".codex/.codex-global-state.json").write_text(json.dumps({
+        "projectless-thread-ids": ["codex-session"],
+        "fixtureSourceOnly": True,
+    }))
+    (target / ".codex/.codex-global-state.json").write_text(json.dumps({
+        "projectless-thread-ids": ["existing-codex"],
+        "fixtureTargetOnly": True,
+    }))
+    registry = home / ".dsh/storages/workspace.json"
+    value = json.loads(registry.read_text())
+    value["tables"]["workspaces"]["project"]["sessionIds"].clear()
+    registry.write_text(json.dumps(value))

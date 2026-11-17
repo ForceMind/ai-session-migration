@@ -21,9 +21,11 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QVBox
 from . import __version__
 from .adapters import LocalLibrary
 from .backup import make_backup, save_recovery_key, verify_package, verify_encrypted, decrypt_for_preview, resume_backup
+from .codex_sidebar import explicitly_projectless
 from .models import PROVIDERS, Attachment
 from .packages import PackageLibrary
-from .importer import build_plan, execute_import, rollback_import, validate_backup_location
+from .importer import (build_plan, execute_import, preview_codex_sidebar, read_projectless_id_list,
+                       repair_codex_sidebar, rollback_import, validate_backup_location)
 from .safeio import within
 from .state import AppState
 from .theme import STYLE
@@ -169,7 +171,8 @@ class SessionDelegate(QStyledItemDelegate):
         painter.setPen(QColor(fg))
         painter.drawText(x + 28, y + 37, char)
         painter.setPen(QColor("#8c9aab"))
-        meta = r.project + (" · 已归档" if r.archived else "") + (" · 子任务" if r.child else "")
+        group = "独立会话" if explicitly_projectless(r) else r.project
+        meta = group + (" · 已归档" if r.archived else "") + (" · 子任务" if r.child else "")
         painter.drawText(x + 46, y + 37, option.fontMetrics.elidedText(meta, Qt.TextElideMode.ElideRight, box.width() - 120))
         if r.issue:
             painter.setPen(QColor("#e9c17d"))
@@ -903,7 +906,9 @@ class MainWindow(QMainWindow):
 
     def build_imports(self):
         page, layout = self._replace_page("imports")
-        self._heading(layout, "导入记录", "完整目标备份和恢复日志保留在本机", [button("打开恢复记录", self.choose_import_result), button("打开迁移包", self.open_package)])
+        self._heading(layout, "导入记录", "完整目标备份和恢复日志保留在本机", [
+            button("补登记 Codex 独立会话", self.open_codex_sidebar_repair),
+            button("打开恢复记录", self.choose_import_result), button("打开迁移包", self.open_package)])
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         holder = QWidget(); rows = QVBoxLayout(holder)
         for report in self.state.data.get("imports", []):
@@ -916,6 +921,12 @@ class MainWindow(QMainWindow):
         if not self.state.data.get("imports"):
             rows.addWidget(label("打开迁移包后，可从会话库进入“导入到本机”。", "Muted", True))
         rows.addStretch(); scroll.setWidget(holder); layout.addWidget(scroll)
+
+    def open_codex_sidebar_repair(self, target=None):
+        if self.busy or self.loading:
+            self.error("请先等待当前任务结束。")
+            return
+        CodexSidebarDialog(self, target=target).exec()
 
     def open_import_result(self, report):
         try:
@@ -948,6 +959,9 @@ class MainWindow(QMainWindow):
             content.addWidget(SafeText(str(report.get("error", "")) + "\n" + str(report.get("recoveryError", "")), plain=True))
         if report.get("output"):
             content.addWidget(button("打开备份和恢复日志", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(report["output"]))))
+        codex_target = next((root["target"] for root in report.get("roots", []) if root.get("provider") == "codex"), None)
+        if state == "complete" and codex_target:
+            content.addWidget(button("补登记 Codex 独立会话", lambda: self.open_codex_sidebar_repair(codex_target)))
         if state != "rolled-back" and report.get("roots"):
             content.addWidget(button("撤销本次导入 / 恢复到导入前", lambda: self.undo_import(report)))
         content.addWidget(button("查看导入记录", lambda: self.navigate("imports")))
@@ -1170,6 +1184,133 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(150, self._close_when_idle)
 
 
+class CodexSidebarDialog(QDialog):
+    def __init__(self, owner, target=None):
+        super().__init__(owner)
+        self.owner = owner
+        self.plan = None
+        self.working = False
+        self.setWindowTitle("补登记 Codex 独立会话")
+        self.resize(820, 590)
+        layout = QVBoxLayout(self)
+        layout.addWidget(label("退出目标 Codex 后，勾选你确认原本在项目之外的会话。检查通过后可备份侧栏配置并补登记。", "Info", True))
+        default = os.environ.get("CODEX_HOME") or str(owner.home / ".codex")
+        self.target = self.path_row(layout, "Codex 资料目录", str(target or default))
+        self.backup = self.path_row(layout, "私密备份位置", str(owner.state.root / "导入备份"))
+        self.inventory = self.path_row(layout, "项目外会话清单（可选）", "", file=True)
+        self.inventory.setPlaceholderText("可选用之前修复包里的项目外会话清单.json")
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("按标题或会话 ID 查找")
+        self.search.textChanged.connect(self.filter_rows)
+        layout.addWidget(self.search)
+        self.items = QListWidget()
+        self.items.itemChanged.connect(self.refresh_gate)
+        layout.addWidget(self.items, 1)
+        self.notice = label("请选择导入时使用的 Codex 资料目录。", "Muted", True)
+        layout.addWidget(self.notice)
+        actions = QHBoxLayout()
+        self.inspect_button = button("只读检查", self.inspect)
+        self.apply_button = button("备份并补登记", self.apply, True)
+        actions.addWidget(self.inspect_button)
+        actions.addStretch()
+        actions.addWidget(self.apply_button)
+        layout.addLayout(actions)
+        for field in (self.target, self.inventory):
+            field.textChanged.connect(self.reset_plan)
+        self.backup.textChanged.connect(self.refresh_gate)
+        self.refresh_gate()
+
+    def path_row(self, layout, title, value, file=False):
+        layout.addWidget(label(title, "Muted"))
+        row = QHBoxLayout()
+        field = QLineEdit(value)
+        def choose():
+            if file:
+                path, _ = QFileDialog.getOpenFileName(self, title, field.text(), "会话清单 (*.json)")
+            else:
+                path = QFileDialog.getExistingDirectory(self, title, field.text())
+            if path:
+                field.setText(path)
+        row.addWidget(field, 1)
+        row.addWidget(button("选择…", choose))
+        layout.addLayout(row)
+        return field
+
+    def selected_ids(self):
+        return [self.items.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.items.count())
+                if self.items.item(i).checkState() == Qt.CheckState.Checked]
+
+    def refresh_gate(self, *_):
+        self.inspect_button.setEnabled(not self.working and bool(self.target.text().strip()))
+        self.apply_button.setEnabled(not self.working and self.plan is not None and bool(self.selected_ids())
+                                     and bool(self.backup.text().strip()))
+
+    def reset_plan(self, *_):
+        self.plan = None
+        self.items.clear()
+        self.notice.setText("请重新检查目标会话。")
+        self.refresh_gate()
+
+    def filter_rows(self, value):
+        for i in range(self.items.count()):
+            item = self.items.item(i)
+            item.setHidden(value.casefold() not in item.text().casefold())
+
+    def run_task(self, work, done, message):
+        self.working = self.owner.loading = True
+        self.setEnabled(False)
+        self.notice.setText(message)
+        def finish(result):
+            self.working = self.owner.loading = False
+            self.setEnabled(True)
+            done(result)
+            self.refresh_gate()
+        def failed(error):
+            self.working = self.owner.loading = False
+            self.setEnabled(True)
+            self.notice.setText(error)
+            self.refresh_gate()
+        self.owner.task(lambda _progress: work(), finish, message, failed)
+
+    def inspect(self):
+        self.reset_plan()
+        root = Path(self.target.text().strip())
+        ids_path = self.inventory.text().strip()
+        def work():
+            ids = read_projectless_id_list(Path(ids_path)) if ids_path else None
+            return preview_codex_sidebar(root, self.owner.state.cache, ids)
+        def done(plan):
+            self.plan = plan
+            for row in plan.rows:
+                item = QListWidgetItem(f"{row['status']} · {row['title']}\n{row['id']}")
+                item.setData(Qt.ItemDataRole.UserRole, row["id"])
+                if row["status"] == "可补登记":
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(Qt.CheckState.Unchecked)
+                self.items.addItem(item)
+            self.filter_rows(self.search.text())
+            self.notice.setText(f"检查完成。{sum(row['status'] == '可补登记' for row in plan.rows)} 条可补登记。")
+        self.run_task(work, done, "正在只读检查 Codex 会话索引…")
+
+    def apply(self):
+        plan, ids, destination = self.plan, self.selected_ids(), Path(self.backup.text().strip())
+        if not plan or not ids:
+            return
+        answer = QMessageBox.question(
+            self, "确认补登记", f"确认 Codex 已退出，并为所选 {len(ids)} 条会话备份和补登记侧栏？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.reset_plan()
+        self.run_task(lambda: repair_codex_sidebar(plan, ids, destination, self.owner.state.cache, confirmed_offline=True),
+                      lambda result: self.notice.setText(f"已补登记 {result['added']} 条。重开 Codex 核对侧栏。\n备份：{result['backup']}"),
+                      "正在备份并补登记…")
+
+    def reject(self):
+        if not self.working:
+            super().reject()
+
+
 class ImportWizard(QDialog):
     def __init__(self, owner: MainWindow):
         super().__init__(owner)
@@ -1221,6 +1362,11 @@ class ImportWizard(QDialog):
         self._directory_row(self.paths_layout, desktop, "选择 Claude Desktop Code 目标索引容器")
         self.paths_layout.addWidget(label("项目路径映射", "Section"))
         self.paths_layout.addWidget(label("选择目标机已有的项目文件夹。这里仅映射会话归属，不写入、替换或执行项目工作文件。", "Muted", True))
+        self.projectless_cwd = QLineEdit()
+        if any(explicitly_projectless(record) for record in owner.records):
+            self.paths_layout.addWidget(label("Codex 独立会话工作目录（可选）", "Muted"))
+            self.projectless_cwd.setPlaceholderText("未单独映射时可共用此工作目录，仍显示在项目之外")
+            self._directory_row(self.paths_layout, self.projectless_cwd, "选择独立会话工作目录")
         for cwd in sorted({r.cwd for r in owner.records}):
             self.paths_layout.addWidget(label(cwd or "原会话未记录项目", "Muted", True))
             default = cwd if cwd and Path(cwd).is_absolute() and Path(cwd).is_dir() and not cwd.startswith(("\\\\", "//")) else ""
@@ -1309,7 +1455,7 @@ class ImportWizard(QDialog):
                     state = {"import": "新增", "skip": "跳过", "blocked": "阻止"}[item["action"]]
                     text = state + " · " + PROVIDERS[item["record"]["provider"]] + " · " + item["record"]["title"] + "\n" + item["reason"]
                     if item["action"] == "import":
-                        text += "\n目标：" + plan.targets[item["record"]["provider"]] + "\n项目：" + item["cwd"]
+                        text += "\n目标：" + plan.targets[item["record"]["provider"]] + "\n工作目录：" + item["cwd"]
                     self.preview.addItem(text)
                 self.preview_notice.setText("目标备份位置：" + self.destination.text() + "\n\n" + "\n".join(plan.warnings))
                 self.offline.setChecked(False); self.private_backup.setChecked(False); self.update_gate()
@@ -1318,8 +1464,10 @@ class ImportWizard(QDialog):
                 self.previous.setText("上一步")
                 self.error_notice.setText(message); self.update_gate()
             destination_value = Path(self.destination.text().strip())
+            projectless_cwd = self.projectless_cwd.text().strip()
             def inspect(progress):
-                plan = build_plan(self.owner.library, selected, targets, mapping, self.owner.state.cache, progress, self.preview_cancel)
+                plan = build_plan(self.owner.library, selected, targets, mapping, self.owner.state.cache, progress,
+                                  self.preview_cancel, codex_projectless_cwd=projectless_cwd)
                 validate_backup_location(plan, destination_value, self.owner.state.cache)
                 return plan
             task = self.owner.task(inspect, done, "正在预览导入冲突", failed)

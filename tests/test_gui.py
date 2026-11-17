@@ -1,11 +1,13 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 from pathlib import Path
+from contextlib import closing
+import json, sqlite3
 import tempfile,unittest,time
 from unittest.mock import patch
-from PySide6.QtWidgets import QApplication,QLabel
+from PySide6.QtWidgets import QApplication,QLabel,QMessageBox
 from PySide6.QtCore import Qt,QUrl
-from ai_session_migration.gui import MainWindow,BackupWizard,ImportWizard,SafeText,label
+from ai_session_migration.gui import MainWindow,BackupWizard,CodexSidebarDialog,ImportWizard,SafeText,label
 from ai_session_migration.adapters import LocalLibrary
 from ai_session_migration.backup import make_backup,save_recovery_key
 from ai_session_migration.packages import PackageLibrary
@@ -95,6 +97,33 @@ class GuiTest(unittest.TestCase):
         self.wait_tasks()
         self.assertEqual(self.window.state.data['imports'][0]['status'],'rolled-back')
         self.assertTrue(self.window.state.data['imports'][0]['rollbackVerified'])
+
+    def test_sidebar_dialog_requires_preview_and_explicit_selection(self):
+        make_import_target(self.base / 'target')
+        target = self.base / 'target/.codex'
+        with closing(sqlite3.connect(target / 'state_5.sqlite')) as db, db:
+            db.execute('ALTER TABLE threads ADD COLUMN project_id TEXT')
+        index = target / '.codex-global-state.json'
+        index.write_text(json.dumps({'other': {'preserve': True}}))
+        ids = self.base / 'ids.json'
+        ids.write_text(json.dumps({'schema': 'asm-codex-projectless-1', 'ids': ['existing-codex', 'not-imported']}))
+        dialog = CodexSidebarDialog(self.window, target=target)
+        dialog.inventory.setText(str(ids))
+        with patch('ai_session_migration.importer.native_processes', return_value=[]):
+            self.assertFalse(dialog.apply_button.isEnabled())
+            dialog.inspect_button.click()
+            self.wait_tasks()
+            self.assertIn('可补登记', dialog.items.item(0).text())
+            self.assertIn('目标未找到记录', dialog.items.item(1).text())
+            self.assertFalse(dialog.apply_button.isEnabled())
+            dialog.items.item(0).setCheckState(Qt.CheckState.Checked)
+            self.assertTrue(dialog.apply_button.isEnabled())
+            with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes):
+                dialog.apply_button.click()
+                self.wait_tasks()
+            self.assertIn('已补登记 1 条', dialog.notice.text())
+        self.assertEqual(json.loads(index.read_text()), {'other': {'preserve': True}, 'projectless-thread-ids': ['existing-codex']})
+        dialog.close()
 
 
 if __name__=='__main__':unittest.main()

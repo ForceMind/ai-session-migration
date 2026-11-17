@@ -15,7 +15,8 @@ from urllib.parse import urlparse, unquote
 from typing import Iterator
 
 from .models import Attachment, Catalog, Message, SessionPage, SessionRecord, identity
-from .safeio import SnapshotStore, header, open_lines, read_json, walk_files, within, stable_bytes, owned_file, directory_issue, remote_path
+from .codex_sidebar import ASSIGNMENTS, PROJECTLESS, sidebar_state
+from .safeio import ReadFailure, SnapshotStore, header, open_lines, read_json, walk_files, within, stable_bytes, owned_file, directory_issue, remote_path
 
 
 def timestamp(value) -> float:
@@ -230,6 +231,12 @@ class LocalLibrary:
         return records
 
     def _scan_codex(self, root: Path, db_root_override=None):
+        try:
+            _, sidebar = sidebar_state(root)
+            independent_ids = set(sidebar.get(PROJECTLESS, [])) - sidebar.get(ASSIGNMENTS, {}).keys()
+        except (OSError, ValueError, ReadFailure):
+            # Desktop state is optional for CLI profiles. Keep the native history.
+            independent_ids = set()
         db_root = root
         try:
             config = tomllib.loads(stable_bytes(root / "config.toml", 2 * 1024 * 1024).decode())
@@ -265,6 +272,8 @@ class LocalLibrary:
                 record.files = [str(p) for p in candidates if owned_file(p, root)]
                 history_dbs = sorted(db_root.glob("thread_history_*.sqlite"))
                 record.metadata = {"state_database": str(databases[-1]), "history_database": str(history_dbs[-1]) if history_dbs else "", "history_mode": d.get("history_mode", "legacy"), "model_provider": d.get("model_provider", ""), "parent_id": d.get("attached_thread_parent_id"), "internal_review": '"guardian"' in source, "native_thread_metadata": d}
+                if sid in independent_ids and not record.child and not d.get("project_id") and not record.metadata["parent_id"]:
+                    record.metadata["codex_projectless"] = True
                 if d.get("project_id") in project_titles:
                     record.metadata["project_title"] = project_titles[d["project_id"]]
                 record.issue = directory_issue(cwd, self.check_project_paths)

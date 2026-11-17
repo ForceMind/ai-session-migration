@@ -9,6 +9,7 @@ from contextlib import contextmanager
 import csv
 import ctypes
 from dataclasses import dataclass, field
+import hashlib
 import io
 import json
 import os
@@ -27,10 +28,11 @@ import zipfile
 import zstandard
 
 from .adapters import LocalLibrary
-from .backup import check_cancel as _check_cancel, verify_package
+from .backup import Cancelled, check_cancel as _check_cancel, verify_package
+from .codex_sidebar import ASSIGNMENTS, INDEX_FILENAME, PROJECTLESS, append_projectless, explicitly_projectless, sidebar_state
 from .models import SessionRecord
 from .packages import PackageLibrary
-from .safeio import (CHUNK, MAX_LINE, SnapshotStore, atomic_json, hash_file,
+from .safeio import (CHUNK, MAX_LINE, ReadFailure, SnapshotStore, atomic_json, hash_file,
                      independent_copy, open_lines, remote_path, stable_bytes, within)
 
 SCHEMA = "asm-native-import-1"
@@ -85,19 +87,26 @@ def inventory(root: Path, progress=lambda *_: None, cancel=None) -> dict:
     return {"exists": True, "files": result}
 
 
-def native_processes(targets: dict[str, str]) -> list[str]:
+def native_processes(targets: dict[str, str], *, force=False) -> list[str]:
     """Refuse known live native clients for normal client homes; never terminate them."""
     defaults = {Path.home() / ".claude", Path.home() / ".codex", Path.home() / ".dsh"}
     defaults.update(Path(os.environ[v]).expanduser() for v in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "DSH_HOME"] if os.environ.get(v))
-    if not any(Path(p).resolve() in {d.resolve() for d in defaults} for p in targets.values()):
+    if not force and not any(Path(p).resolve() in {d.resolve() for d in defaults} for p in targets.values()):
         return []
+    process_names = set()
+    if "codex" in targets:
+        process_names.add("codex")
+    if {"claude", "claude_desktop"} & targets.keys():
+        process_names.add("claude")
+    if "deepseek" in targets:
+        process_names.update({"dsh", "deepseek", "deepseek harness"})
     try:
         if sys.platform == "win32":
             out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, check=True, timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
             names = [r[0].lower() for r in csv.reader(io.StringIO(out)) if r]
-            return sorted({n for n in names if n in {"claude.exe", "codex.exe", "dsh.exe", "deepseek.exe"}})
+            return sorted({n for n in names if n.removesuffix(".exe") in process_names})
         out = subprocess.run(["ps", "-ax", "-o", "comm="], capture_output=True, text=True, check=True, timeout=15).stdout
-        return sorted({Path(line.strip()).name for line in out.splitlines() if Path(line.strip()).name.lower() in {"claude", "codex", "dsh", "deepseek"}})
+        return sorted({Path(line.strip()).name for line in out.splitlines() if Path(line.strip()).name.lower() in process_names})
     except (OSError, subprocess.SubprocessError) as error:
         raise ValueError("无法检查原客户端是否已退出，未开始写入：" + type(error).__name__) from error
 
@@ -183,6 +192,111 @@ def codex_databases(root: Path, expected_root=None):
 
 
 @dataclass
+class SidebarPlan:
+    target: Path
+    prior_sha256: str | None
+    rows: list[dict]
+
+
+def read_projectless_id_list(path: Path):
+    document = json.loads(stable_bytes(path, CHUNK))
+    if not isinstance(document, dict) or document.get("schema") != "asm-codex-projectless-1":
+        raise ValueError("请选择本工具的项目外会话清单")
+    ids = document.get("ids")
+    if not isinstance(ids, list) or not ids or len(ids) > 10000 or not all(isinstance(sid, str) for sid in ids):
+        raise ValueError("项目外会话清单无效")
+    return tuple(dict.fromkeys(safe_segment(sid) for sid in ids))
+
+
+def preview_codex_sidebar(target, cache, ids=None):
+    """Only list target rows. An optional source inventory scopes old-package repair."""
+    root = checked_directory(target)
+    if within(cache, root) or within(root, cache):
+        raise ValueError("请把工具缓存放在 Codex 资料目录之外")
+    targets = {"codex": str(root)}
+    if native_processes(targets, force=True):
+        raise ValueError("请先完全退出 Codex 及后台任务")
+    before, side = sidebar_state(root)
+    state, _ = codex_databases(root)
+    c = SnapshotStore(Path(cache) / "codex-sidebar-preview").connect(state)
+    try:
+        columns = {row[1] for row in c.execute("PRAGMA table_info(threads)")}
+        if not {"id", "project_id", "archived"} <= columns:
+            raise ValueError("目标 Codex 会话索引缺少项目归属字段")
+        title = next((name for name in ("name", "title") if name in columns), "id")
+        names = list(dict.fromkeys(["id", "project_id", "archived", title] + [name for name in ("source", "attached_thread_parent_id") if name in columns]))
+        records = {row["id"]: dict(row) for row in c.execute("SELECT " + ", ".join(names) + " FROM threads ORDER BY rowid")}
+    finally:
+        c.close()
+    listed = set(side.get(PROJECTLESS, []))
+    assigned = side.get(ASSIGNMENTS, {})
+    rows = []
+    for sid in ids if ids is not None else records:
+        record = records.get(sid)
+        if not record:
+            status = "目标未找到记录"
+        elif (record["archived"] != 0 or record.get("attached_thread_parent_id")
+              or "subagent" in str(record.get("source", "")).casefold()):
+            status = "已归档、子会话或状态未知"
+        elif record["project_id"] or sid in assigned:
+            status = "已有项目归属"
+        elif sid in listed:
+            status = "已登记"
+        else:
+            safe_segment(sid)
+            status = "可补登记"
+        if ids is not None or status == "可补登记":
+            rows.append({"id": sid, "title": (record or {}).get(title) or sid, "status": status})
+    if sidebar_state(root)[0] != before:
+        raise ValueError("侧栏配置在检查期间变化，请重试")
+    return SidebarPlan(root, hashlib.sha256(before).hexdigest() if before is not None else None, rows)
+
+
+def repair_codex_sidebar(plan, selected, backup_directory, cache, *, confirmed_offline=False):
+    if not confirmed_offline:
+        raise ValueError("请确认 Codex 及后台任务已完全退出")
+    ids = tuple(dict.fromkeys(selected))
+    if not ids or not set(ids) <= {row["id"] for row in plan.rows if row["status"] == "可补登记"}:
+        raise ValueError("请先预览并勾选可补登记的会话")
+    backup_directory = checked_directory(backup_directory)
+    if within(backup_directory, plan.target):
+        raise ValueError("请选择 Codex 资料目录之外的私密备份位置")
+    targets = {"codex": str(plan.target)}
+    with target_locks(targets, cache):
+        current = preview_codex_sidebar(plan.target, cache, ids)
+        if current.prior_sha256 != plan.prior_sha256 or any(row["status"] != "可补登记" for row in current.rows):
+            raise ValueError("目标会话归属或侧栏配置已变化，请重新预览")
+        original, state = sidebar_state(plan.target)
+        if (hashlib.sha256(original).hexdigest() if original is not None else None) != plan.prior_sha256:
+            raise ValueError("目标侧栏配置已变化，请重新预览")
+        updated = append_projectless(state, ids)
+        output = backup_directory / ("Codex侧栏-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:10])
+        output.mkdir(mode=0o700, parents=True)
+        if original is not None:
+            backup = output / INDEX_FILENAME
+            _write_new(backup, original)
+            if stable_bytes(backup, 64 * CHUNK) != original:
+                raise ValueError("侧栏备份回读失败，尚未修改目标")
+        else:
+            atomic_json(output / "原状态.json", {"existed": False})
+        index = plan.target / INDEX_FILENAME
+        stage = plan.target / (".asm-sidebar-" + uuid.uuid4().hex + ".tmp")
+        try:
+            atomic_json(stage, updated)
+            if native_processes(targets, force=True) or sidebar_state(plan.target)[0] != original:
+                raise ValueError("侧栏配置在写入前变化，请重新预览")
+            if original is None:
+                rename_new(stage, index)
+            else:
+                os.replace(stage, index)
+            if sidebar_state(plan.target)[1] != updated:
+                raise ValueError(f"侧栏配置回读不一致，请查看备份：{output}")
+        finally:
+            stage.unlink(missing_ok=True)
+        return {"added": len(ids), "backup": str(output)}
+
+
+@dataclass
 class ImportPlan:
     archive: str
     archive_sha256: str
@@ -201,7 +315,7 @@ class ImportPlan:
         return asdict(self)
 
 
-def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: dict, mappings: dict, cache: Path, progress=lambda *_: None, cancel=None) -> ImportPlan:
+def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: dict, mappings: dict, cache: Path, progress=lambda *_: None, cancel=None, *, codex_projectless_cwd="") -> ImportPlan:
     if not selected:
         raise ValueError("请先选择要导入的包内会话")
     if package.package_catalog is None:
@@ -213,7 +327,10 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
     if not providers <= PROVIDERS or not providers <= targets.keys():
         raise ValueError("请为每种来源选择目标资料目录")
     clean = {p: str(checked_directory(Path(targets[p]))) for p in sorted(providers)}
-    if "claude" in providers and targets.get("claude_desktop"):
+    if targets.get("claude_desktop") and any(
+        record.provider == "claude" and any(e.get("role") == "claude-desktop-index" for e in entries_for(package, record))
+        for record in selected
+    ):
         clean["claude_desktop"] = str(checked_directory(Path(targets["claude_desktop"])))
     for p, v in clean.items():
         root = Path(v)
@@ -229,9 +346,11 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
     reader = LocalLibrary(cache / "isolated-home", cache / "import-preview")
     for provider, value in clean.items():
         root = Path(value)
-        before[provider] = inventory(root, progress, cancel)
+        if provider != "claude_desktop":
+            before[provider] = inventory(root, progress, cancel)
         try:
             if provider == "claude_desktop":
+                before[provider] = inventory(root, progress, cancel)
                 existing[provider] = {str(json.loads(stable_bytes(p)).get("cliSessionId")) for p in root.glob("local_*.json")}
                 continue
             existing[provider] = {r.session_id for r in getattr(reader, "_scan_" + provider)(root)}
@@ -243,26 +362,29 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
                 if registry.get("unit") != {"name": "workspace", "version": 2}:
                     raise ValueError("DeepSeek 项目注册表版本不兼容")
                 existing[provider].update(sid for p in registry.get("tables", {}).get("workspaces", {}).values() for sid in p.get("sessionIds", []))
+        except Cancelled:
+            raise
         except Exception as error:
             existing[provider] = set()
             issues[provider] = str(error)
     items, seen = [], {}
+    deepseek_registries = {
+        registry["sourceRoot"] for registry in package.package_catalog.get("registries", [])
+        if registry.get("unit") == {"name": "workspace", "version": 2}
+    }
     for selected_record in selected:
         check_cancel(cancel)
         record = records.get(selected_record.uid)
         if record is None:
             raise ValueError("数据包目录已变化，请重新打开迁移包")
-        item = {"record": record.to_dict(), "action": "import", "reason": "新增会话；保留现有资料", "cwd": str(mappings.get(record.cwd, ""))}
+        independent = explicitly_projectless(record)
+        item = {"record": record.to_dict(), "action": "import", "reason": "新增会话", "cwd": str(mappings.get(record.cwd, "") or (codex_projectless_cwd if independent else ""))}
         try:
             safe_segment(record.session_id)
             if record.provider in issues:
                 raise ValueError(issues[record.provider])
-            if record.provider == "claude" and "claude_desktop" in issues:
-                raise ValueError("Desktop 索引目录不兼容：" + issues["claude_desktop"])
             if record.session_id in existing[record.provider]:
                 item.update(action="skip", reason="目标已有相同 ID，保留目标记录并跳过")
-            elif record.provider == "claude" and record.session_id in existing.get("claude_desktop", set()):
-                item.update(action="skip", reason="目标 Desktop 索引已有同一 Code 会话，未覆盖")
             elif not item["cwd"] or not checked_directory(Path(item["cwd"])).is_dir():
                 raise ValueError("请将原项目映射到目标机已存在的项目目录")
             elif record.provider in {"claude", "deepseek"} and not source_logs(package, record):
@@ -270,6 +392,11 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
             elif record.provider == "deepseek" and record.metadata.get("format_version") != 4:
                 raise ValueError("当前仅支持 DeepSeek v4 原生导入，其他代际仍可保全/预览")
             elif record.provider == "codex":
+                if independent:
+                    _, sidebar = sidebar_state(Path(clean["codex"]))
+                    append_projectless(sidebar, [record.session_id])
+                    item["codex_projectless"] = True
+                    item["reason"] = "新增独立会话，并恢复桌面侧栏登记"
                 native = native_rows(package, record)
                 state, history = codex_databases(Path(clean["codex"]))
                 if any(r.get("table") in HISTORY_TABLES for r in native) and history is None:
@@ -285,19 +412,28 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
                             raise ValueError("目标存在同 ID 附件记录，未覆盖")
                     finally:
                         c.close()
-            if item["action"] == "import" and record.provider == "claude" and "claude_desktop" in clean:
+            if item["action"] == "import" and record.provider == "deepseek" and record.root in deepseek_registries and record.metadata.get("registered") is False:
+                item["deepseek_ungrouped"] = True
+                item["reason"] = "新增会话，保留未分组状态"
+            if item["action"] == "import" and record.provider == "claude":
                 indexes = [e for e in entries_for(package, record) if e.get("role") == "claude-desktop-index"]
-                if not indexes:
-                    raise ValueError("包内缺少 Desktop 原始索引；请重新导出，或清空可选的 Desktop 索引目录")
-                name = PurePosixPath(indexes[0]["originalPath"].replace("\\", "/")).name
-                if (Path(clean["claude_desktop"]) / name).exists():
-                    item.update(action="skip", reason="目标已有同名 Desktop 索引文件，未覆盖")
+                if not indexes or "claude_desktop" not in clean:
+                    item["reason"] = "恢复 Code 本地日志；" + ("未选择 Desktop 索引目录" if indexes else "包内没有 Desktop 索引")
+                elif "claude_desktop" in issues:
+                    item["reason"] = "恢复 Code 本地日志；目标 Desktop 索引目录不兼容"
+                else:
+                    name = PurePosixPath(indexes[0]["originalPath"].replace("\\", "/")).name
+                    if record.session_id in existing["claude_desktop"] or (Path(clean["claude_desktop"]) / name).exists():
+                        item["reason"] = "恢复 Code 本地日志，并保留目标已有 Desktop 索引"
+                    else:
+                        item["claude_desktop_index"] = True
+                        item["reason"] = "恢复 Code 本地日志与 Desktop 索引"
             key = (record.provider, record.session_id)
             if key in seen:
                 item.update(action="blocked", reason="包内多来源副本使用相同 ID，请只选择一份再预览")
                 seen[key].update(action="blocked", reason=item["reason"])
             seen[key] = item
-        except (ValueError, OSError) as error:
+        except (ValueError, OSError, ReadFailure) as error:
             item.update(action="blocked", reason=str(error))
         items.append(item)
     # A child must keep its parent relationship, rather than silently becoming a root.
@@ -330,7 +466,7 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
                 changed = True
     # Include only providers that can actually receive at least one session.
     active = {i["record"]["provider"] for i in items if i["action"] == "import"}
-    if "claude" in active and "claude_desktop" in clean:
+    if any(i["action"] == "import" and i.get("claude_desktop_index") for i in items):
         active.add("claude_desktop")
     clean = {p: v for p, v in clean.items() if p in active}
     before = {p: v for p, v in before.items() if p in active}
@@ -620,7 +756,7 @@ def _stage_sessions(package, items, stages, cancel):
             _rewrite_log(package._extract(e["object"], original.name), destination, "claude", item["cwd"], cancel, sid, attachment_map)
             item["source_session_dir"] = str(original.parent / sid)
             item["session_dir"] = str(destination.parent / sid)
-            if "claude_desktop" in stages:
+            if item.get("claude_desktop_index"):
                 indexes = [e for e in entries_for(package, record) if e.get("role") == "claude-desktop-index"]
                 if not indexes:
                     raise ValueError("包内缺少 Claude Desktop 索引，请用 0.2.0 或更新客户端重新导出，或不选择 Desktop 索引目录")
@@ -636,6 +772,7 @@ def _stage_sessions(package, items, stages, cancel):
                 data = {k: v for k, v in source_index.items() if k in allowed}
                 data.update(cwd=item["cwd"], originCwd=item["cwd"], permissionMode="default", isArchived=record.archived)
                 _write_new(stages["claude_desktop"] / original_name, (json.dumps(data, ensure_ascii=False) + "\n").encode())
+                item["claude_desktop_filename"] = original_name
         elif record.provider == "deepseek":
             destination = root / "sessions" / dsh_project_key(item["cwd"]) / sid
             # Only v4 is transformed; preserved historical generations stay in the package.
@@ -665,6 +802,10 @@ def _stage_sessions(package, items, stages, cancel):
             codex.append(item)
     if codex:
         _codex_stage(package, codex, stages["codex"], cancel)
+        ids = [i["record"]["session_id"] for i in codex if i.get("codex_projectless")]
+        if ids:
+            _, state = sidebar_state(stages["codex"])
+            atomic_json(stages["codex"] / INDEX_FILENAME, append_projectless(state, ids))
     if "deepseek" in stages:
         _dsh_registry(package, [i for i in items if i["record"]["provider"] == "deepseek"], stages["deepseek"])
 
@@ -678,6 +819,11 @@ def _dsh_registry(package, items, root):
     for item in items:
         record = SessionRecord.from_dict(item["record"])
         sid, cwd = record.session_id, item["cwd"]
+        for name, enabled in [("archivedSessionIds", record.archived), ("pinnedSessionIds", record.pinned)]:
+            if enabled and sid not in g.setdefault(name, []):
+                g[name].append(sid)
+        if item.get("deepseek_ungrouped"):
+            continue
         wid = next((w for w, p in projects.items() if p.get("path") == cwd), None)
         if wid is None:
             wid = "asm-" + uuid.uuid5(uuid.NAMESPACE_URL, cwd).hex
@@ -692,9 +838,6 @@ def _dsh_registry(package, items, root):
             g["workspaceIds"].append(wid)
         if not g.get("defaultWorkspaceId"):
             g["defaultWorkspaceId"] = wid
-        for name, enabled in [("archivedSessionIds", record.archived), ("pinnedSessionIds", record.pinned)]:
-            if enabled and sid not in g.setdefault(name, []):
-                g[name].append(sid)
     atomic_json(path, registry)
 
 
@@ -717,6 +860,14 @@ def validate_staged(package, items, stages, cache):
                 raise ValueError("暂存原生历史回读与包内历史不一致，未发布")
             if restored.cwd != item["cwd"]:
                 raise ValueError("暂存项目路径映射核验失败")
+            if item.get("codex_projectless") and restored.metadata.get("codex_projectless") is not True:
+                raise ValueError("Codex 独立会话侧栏登记回读失败")
+            if item.get("deepseek_ungrouped") and restored.metadata.get("registered") is not False:
+                raise ValueError("DeepSeek 未分组状态回读失败")
+            if item.get("claude_desktop_index"):
+                index = json.loads(stable_bytes(stages["claude_desktop"] / item["claude_desktop_filename"]))
+                if index.get("cliSessionId") != source.session_id or index.get("cwd") != item["cwd"]:
+                    raise ValueError("Claude Desktop 索引回读失败")
             if [(m.kind, m.text) for m in original_page.messages if m.kind == "thinking"] != [(m.kind, m.text) for m in restored_page.messages if m.kind == "thinking"]:
                 raise ValueError("暂存 thinking 回读不一致，未发布")
             checks.append({"provider": provider, "messages": restored_page.total, "historyReadback": True})

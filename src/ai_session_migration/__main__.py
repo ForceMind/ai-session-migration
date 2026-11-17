@@ -42,12 +42,44 @@ def synthetic_import_acceptance(window):
     if len(plan.ready) != 3:
         raise ValueError("Synthetic import preview did not admit all three providers")
     report = execute_import(plan, window.state.root / "synthetic-target-backups", window.state.cache, confirmed_offline=True)
+    visibility = {}
+    if any(record.metadata.get("codex_projectless") is True for record in selected):
+        from .codex_sidebar import INDEX_FILENAME, PROJECTLESS, sidebar_state
+        from .importer import preview_codex_sidebar, repair_codex_sidebar
+        import shutil
+
+        codex = Path(targets["codex"])
+        _, side = sidebar_state(codex)
+        visibility["codexRegistered"] = side.get(PROJECTLESS) == ["existing-codex", "codex-session"]
+        visibility["targetSidebarPreserved"] = side.get("fixtureTargetOnly") is True and "fixtureSourceOnly" not in side
+        registry = json.loads((Path(targets["deepseek"]) / "storages/workspace.json").read_text(encoding="utf-8"))
+        visibility["deepseekUngrouped"] = all("harness-session" not in workspace["sessionIds"]
+            for workspace in registry["tables"]["workspaces"].values())
+        repair_target = window.state.root / "synthetic-existing-codex"
+        shutil.copytree(codex, repair_target)
+        side[PROJECTLESS] = ["existing-codex"]
+        atomic_json(repair_target / INDEX_FILENAME, side)
+        original = (repair_target / INDEX_FILENAME).read_bytes()
+        db_hash = hash_file(repair_target / "state_5.sqlite")
+        review = preview_codex_sidebar(repair_target, window.state.cache, ["codex-session", "absent-session"])
+        visibility["repairPreview"] = [row["status"] for row in review.rows] == ["可补登记", "目标未找到记录"]
+        visibility["previewReadOnly"] = (repair_target / INDEX_FILENAME).read_bytes() == original
+        repair = repair_codex_sidebar(review, ["codex-session"], window.state.root / "synthetic-sidebar-backups",
+                                      window.state.cache, confirmed_offline=True)
+        visibility["repairVerified"] = (repair["added"] == 1
+            and (Path(repair["backup"]) / INDEX_FILENAME).read_bytes() == original
+            and sidebar_state(repair_target)[1].get(PROJECTLESS) == ["existing-codex", "codex-session"]
+            and hash_file(repair_target / "state_5.sqlite") == db_hash)
+        visibility["ok"] = all(visibility.values())
     duplicate = build_plan(package, selected, targets, {r.cwd: str(target / "示例项目") for r in selected}, window.state.cache)
     restored = rollback_import(Path(report["journal"]), window.state.cache, confirmed_offline=True)
     source_unchanged = before_source == {str(p): hash_file(p) for p in window.home.rglob("*") if p.is_file()}
     target_restored = before == {p: inventory(Path(root)) for p, root in targets.items()}
     result = {"syntheticOnly": True, "providers": sorted(targets), "imported": report["imported"], "backupVerified": report["backupVerified"], "nativeReadback": report["nativeReadback"], "duplicateIdsSkipped": len(duplicate.ready) == 0, "rollbackVerified": restored["rollbackVerified"] and target_restored, "sourceFilesUnchanged": source_unchanged}
     result["ok"] = report["status"] == "complete" and all(result[k] for k in ["backupVerified", "duplicateIdsSkipped", "rollbackVerified", "sourceFilesUnchanged"])
+    if visibility:
+        result["visibility"] = visibility
+        result["ok"] = result["ok"] and visibility["ok"]
     return result
 
 

@@ -46,17 +46,17 @@ jobs:
         shell: pwsh
         run: |
           $env:PYTHONPATH = 'tests'
-          python -c "from pathlib import Path; from fixtures import make_home, make_import_target; make_home(Path('build/smoke-home').resolve()); make_import_target(Path('build/smoke-state/synthetic-import-target').resolve())"
+          python -c "from pathlib import Path; from fixtures import make_packaged_import_fixture; make_packaged_import_fixture(Path('build/smoke-home').resolve(), Path('build/smoke-state/synthetic-import-target').resolve())"
           $client = Join-Path $PWD 'release/AI Session Migration/AI Session Migration.exe'
           $arguments = @('--smoke-home', (Join-Path $PWD 'build/smoke-home'), '--smoke-state', (Join-Path $PWD 'build/smoke-state'), '--smoke-report', (Join-Path $PWD 'build/packaged-smoke.json'), '--smoke-import', '--smoke-recovery')
           $process = Start-Process -FilePath $client -ArgumentList ($arguments | ForEach-Object { '"' + $_ + '"' }) -PassThru -Wait
           if ($process.ExitCode -ne 0) { throw "Packaged client failed: $($process.ExitCode)" }
           $result = Get-Content build/packaged-smoke.json -Raw | ConvertFrom-Json
-          if (-not $result.ok) { throw 'Packaged client acceptance failed' }
+          if (-not $result.ok -or -not $result.syntheticImport.visibility.ok) { throw 'Packaged client acceptance failed' }
       - name: Upload standalone Windows client
         uses: actions/upload-artifact@v4
         with:
-          name: AI-Session-Migration-0.3.1-Windows-x64
+          name: AI-Session-Migration-0.3.2-Windows-x64
           path: release/AI Session Migration/
           retention-days: 14
       - name: Upload synthetic acceptance report
