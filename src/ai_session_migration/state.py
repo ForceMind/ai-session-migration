@@ -34,7 +34,13 @@ class AppState:
         atomic_json(self.path, self.data)
 
     def record_backup(self, report):
-        self.data.setdefault("backups", []).insert(0, {k: report.get(k) for k in ["schema", "status", "output", "portable", "encrypted", "startedAt", "finishedAt", "sessions", "files", "bytes", "warnings", "encryptedReadbackVerified", "keyPath", "plainSha256", "error", "archiveReady", "pendingArchive", "attempts"]})
+        self.data.setdefault("backups", []).insert(0, {k: report.get(k) for k in ["schema", "status", "output", "portable", "encrypted", "startedAt", "finishedAt", "sessions", "files", "bytes", "warnings", "encryptedReadbackVerified", "keyPath", "plainSha256", "error", "archiveReady", "pendingArchive", "attempts", "privacyCheck", "privacyExclusions", "preservationDirectory", "handoff"]})
+        self.save()
+
+    def record_backup_switch(self, candidate, active, prior):
+        other_backups = [row for row in self.data.get("backups", [])
+                         if row.get("output") not in {candidate, active["output"], prior["output"]}]
+        self.data["backups"] = [active, prior, *other_backups]
         self.save()
 
     def record_import(self, report):

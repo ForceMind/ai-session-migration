@@ -1,5 +1,6 @@
 import json
 from contextlib import closing
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 import zipfile
 
@@ -14,7 +16,7 @@ import zstandard
 
 from ai_session_migration.adapters import LocalLibrary
 from ai_session_migration.backup import make_backup, save_recovery_key, Cancelled
-from ai_session_migration.importer import build_plan, execute_import, rollback_import, inventory, dsh_project_key, target_locks
+from ai_session_migration.importer import build_plan, execute_import, rollback_import, inventory, dsh_project_key, preview_import_space, target_locks
 from ai_session_migration.packages import PackageLibrary
 from ai_session_migration.safeio import open_lines, hash_file
 from fixtures import make_home
@@ -32,7 +34,7 @@ class ImportTest(unittest.TestCase):
         save_recovery_key(self.base / 'key.asmkey')
         exported = make_backup(self.library, records, self.base / 'export', self.base / 'key.asmkey')
         self.package = PackageLibrary(Path(exported['portable']), self.base / 'cache')
-        self.selected = self.package.scan().records
+        self.selected = [r for r in self.package.scan().records if r.provider != 'claude']
         self.target = self.base / 'target'
         files = make_home(self.target)
         # Existing native histories use different IDs. Keep their bytes/rows intact.
@@ -65,22 +67,65 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(self.before, {p: inventory(Path(root)) for p, root in self.targets.items()})
         self.assertEqual(self.source_before, fingerprints(self.source))
 
-    def test_three_native_sources_backup_merge_readback_and_conditional_undo(self):
+    def test_dsh_preview_blocks_unusable_windows_staging_path(self):
+        project = self.target / ("项目" * 35)
+        project.mkdir()
+        self.mappings = {r.cwd: str(project) for r in self.selected}
+        with patch("ai_session_migration.importer.legacy_windows_paths", return_value=True):
+            plan = self.plan()
+        dsh = next(item for item in plan.items if item["record"]["provider"] == "deepseek")
+        self.assertEqual(dsh["action"], "blocked")
+        self.assertIn("较短的项目目录", dsh["reason"])
+        self.assertEqual([r["record"]["provider"] for r in plan.ready], ["codex"])
+        self.assert_original_targets()
+
+    def test_import_backup_cannot_write_into_claude_profile(self):
         plan = self.plan()
-        self.assertEqual(len(plan.ready), 3)
+        profile = self.base / "custom-claude-profile"
+        profile.mkdir()
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(profile)}):
+            for path in (Path(self.targets["claude"]) / "backup", profile / "backup"):
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, "原生会话资料"):
+                    execute_import(plan, path, self.base / 'cache', confirmed_offline=True)
+                self.assertFalse(path.exists())
+        self.assert_original_targets()
+
+    def test_import_checks_combined_space_before_creating_staging_or_backups(self):
+        plan = self.plan()
+        backup = self.base / "target-backups"
+        volume, = preview_import_space(plan, self.package, backup)
+        self.assertGreater(volume["stagingBytes"], 0)
+        self.assertEqual(volume["backupBytes"], volume["stagingBytes"])
+        self.assertGreater(volume["estimatedBytes"], volume["minimumBytes"])
+        self.assertFalse(backup.exists())
+        free = volume["minimumBytes"] - 1
+        with patch("ai_session_migration.importer.shutil.disk_usage", return_value=SimpleNamespace(free=free)):
+            blocked, = preview_import_space(plan, self.package, backup)
+            self.assertFalse(blocked["enough"])
+            with self.assertRaisesRegex(ValueError, "完整备份空间不足"):
+                self.execute(plan)
+        self.assertFalse(backup.exists())
+        self.assertFalse(list(self.target.glob(".asm-stage-*")))
+        self.assert_original_targets()
+
+    def test_two_native_sources_backup_merge_readback_and_conditional_undo(self):
+        plan = self.plan()
+        self.assertEqual(len(plan.ready), 2)
         self.assert_original_targets()
         report = self.execute(plan)
         self.assertEqual(report['status'], 'complete')
         self.assertTrue(report['backupVerified'])
         with zipfile.ZipFile(report['backup']) as z:
             for provider, tree in self.before.items():
+                if provider == 'claude':
+                    continue
                 for name, info in tree['files'].items():
                     if not info.get('directory'):
                         import hashlib
                         self.assertEqual(hashlib.sha256(z.read(provider + '/' + name)).hexdigest(), info['sha256'])
         reader = LocalLibrary(self.target, self.base / 'readback-cache')
         records = reader.scan().records
-        self.assertEqual(len(records), 6)
+        self.assertEqual(len(records), 5)
         for imported in self.selected:
             record = next(r for r in records if r.provider == imported.provider and r.session_id == imported.session_id)
             self.assertEqual(record.cwd, str(self.target / '示例项目'))
@@ -137,7 +182,7 @@ execute_import(plan,base/'crash-backups',base/'cache',confirmed_offline=True,fau
 
     def test_target_drift_after_preview_and_during_staging_never_overwrites(self):
         plan = self.plan()
-        new = self.target / '.claude/new-conversation.jsonl'
+        new = self.target / '.codex/new-conversation.jsonl'
         new.write_text('new work after preview')
         with self.assertRaisesRegex(ValueError, '预览后已变化'):
             self.execute(plan)
@@ -197,11 +242,11 @@ execute_import(plan,base/'crash-backups',base/'cache',confirmed_offline=True,fau
 
     def test_nested_backup_symlink_and_shared_target_are_rejected(self):
         with self.assertRaisesRegex(ValueError, '之外'):
-            execute_import(self.plan(), self.target / '.claude/backup', self.base / 'cache', confirmed_offline=True)
+            execute_import(self.plan(), self.target / '.codex/backup', self.base / 'cache', confirmed_offline=True)
         targets = dict(self.targets, codex=self.targets['claude'])
-        with self.assertRaisesRegex(ValueError, '不能重叠'):
+        with self.assertRaisesRegex(ValueError, 'Claude 历史'):
             build_plan(self.package, self.selected, targets, self.mappings, self.base / 'cache')
-        link = self.target / '.claude/link'
+        link = self.target / '.codex/link'
         try:
             link.symlink_to(self.source, target_is_directory=True)
         except OSError:
@@ -232,50 +277,28 @@ execute_import(plan,base/'crash-backups',base/'cache',confirmed_offline=True,fau
         records = self.library.scan().records
         exported = make_backup(self.library, records, self.base / 'export', self.base / 'key.asmkey')
         self.package = PackageLibrary(Path(exported['portable']), self.base / 'cache')
-        self.selected = self.package.scan().records
+        self.selected = [r for r in self.package.scan().records if r.provider != 'claude']
+        self.mappings = {r.cwd: str(self.target / '示例项目') for r in self.selected}
         self.source_before = fingerprints(self.source)
 
-    def test_claude_desktop_index_uses_explicit_account_container_and_discards_permissions(self):
-        index = self.source / 'Library/Application Support/Claude/claude-code-sessions/source-account/source-folder/local_desktop-fixture.json'
-        index.parent.mkdir(parents=True)
-        index.write_text(json.dumps({'sessionId': 'local_desktop-fixture', 'cliSessionId': 'claude-session', 'title': 'Synthetic desktop title', 'cwd': str(self.source / '示例项目'), 'permissionMode': 'bypassPermissions', 'remoteMcpServersConfig': {'synthetic': 'do-not-restore'}, 'sessionPermissionUpdates': ['unsafe']}))
-        self.reexport()
-        desktop = self.target / 'chosen-target-account'
-        desktop.mkdir()
-        existing = desktop / 'local_existing.json'
-        existing.write_text(json.dumps({'cliSessionId': 'unrelated-native-session', 'title': 'keep me'}))
-        before = existing.read_bytes()
-        self.targets['claude_desktop'] = str(desktop)
-        records = [r for r in self.selected if r.provider == 'claude']
-        plan = self.plan(records)
-        self.assertEqual(len(plan.ready), 1)
-        report = self.execute(plan)
-        restored = json.loads((desktop / index.name).read_text())
-        self.assertEqual(restored['cliSessionId'], 'claude-session')
-        self.assertEqual(restored['cwd'], str(self.target / '示例项目'))
-        self.assertEqual(restored['permissionMode'], 'default')
-        self.assertNotIn('remoteMcpServersConfig', restored)
-        self.assertNotIn('sessionPermissionUpdates', restored)
-        self.assertEqual(existing.read_bytes(), before)
-        self.assertTrue(report['backupVerified'])
-        self.assertEqual(self.source_before, fingerprints(self.source))
+    def test_claude_cannot_import_even_if_selection_lies_about_provider(self):
+        from dataclasses import replace
+        claude = next(r for r in self.package.scan().records if r.provider == "claude")
+        for candidate in (claude, replace(claude, provider="codex")):
+            with self.assertRaisesRegex(ValueError, "Claude 历史"):
+                self.plan([candidate])
+        self.assert_original_targets()
 
-    def test_child_session_requires_parent_and_keeps_native_claude_layout(self):
-        original = self.source / '.claude/projects/example/claude-session/subagents/agent-child.jsonl'
+    def test_claude_child_relationship_is_available_in_reading_bundle(self):
+        original = self.source / ".claude/projects/example/claude-session/subagents/agent-child.jsonl"
         original.parent.mkdir(parents=True)
-        original.write_text(json.dumps({'type': 'user', 'sessionId': 'agent-child', 'cwd': str(self.source / '示例项目'), 'message': {'role': 'user', 'content': 'synthetic child task'}}) + '\n')
+        original.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": "synthetic child task"}}) + "\n")
         self.reexport()
-        child = next(r for r in self.selected if r.session_id == 'agent-child')
-        alone = self.plan([child])
-        self.assertEqual(alone.items[0]['action'], 'blocked')
-        self.assertIn('父会话', alone.items[0]['reason'])
-        report = self.execute()
-        self.assertEqual(report['status'], 'complete')
-        reader = LocalLibrary(self.target, self.base / 'child-readback')
-        restored = next(r for r in reader.scan().records if r.session_id == 'agent-child')
-        self.assertTrue(restored.child)
-        self.assertEqual(Path(restored.files[0]).parts[-3:], ('claude-session', 'subagents', 'agent-child.jsonl'))
-        self.assertEqual(self.source_before, fingerprints(self.source))
+        records = self.package.scan().records
+        child = next(r for r in records if r.session_id == "agent-child")
+        parent = next(r for r in records if r.session_id == "claude-session")
+        self.assertEqual(self.package.package_catalog["readings"][child.uid]["parentUid"], parent.uid)
+        self.assert_original_targets()
 
     def test_native_projects_turns_compressed_rollout_offsets_and_policy_reset(self):
         source_log = self.source / '.codex/sessions/rollout-codex-session.jsonl.zst'

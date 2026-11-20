@@ -20,10 +20,11 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QVBox
 
 from . import __version__
 from .adapters import LocalLibrary
-from .backup import make_backup, save_recovery_key, verify_package, verify_encrypted, decrypt_for_preview, resume_backup
+from .backup import estimate_backup, make_backup, rebuild_portable, save_recovery_key, verify_package, verify_encrypted, decrypt_for_preview, resume_backup
 from .models import PROVIDERS, Attachment
+from .migration_policy import NATIVE_PROVIDERS
 from .packages import PackageLibrary
-from .importer import build_plan, execute_import, rollback_import, validate_backup_location
+from .importer import build_plan, execute_import, preview_import_space, rollback_import, validate_backup_location
 from .safeio import within
 from .state import AppState
 from .theme import STYLE
@@ -35,6 +36,19 @@ def human_size(n):
             return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
         n /= 1024
     return f"{n:.1f} PiB"
+
+
+def file_restore_space_text(space):
+    if not space:
+        return ""
+    common = f"新增文件与目录约 {human_size(space['targetBytes'])} · 完整目标备份约 {human_size(space['backupBytes'])}"
+    if space["sameVolume"]:
+        volumes = f"同盘约需 {human_size(space['targetBytes'] + space['backupBytes'] + space['reserveBytes'])} · 可用 {human_size(space['targetAvailable'])}"
+    else:
+        volumes = (f"恢复盘可用 {human_size(space['targetAvailable'])} · 备份盘可用 {human_size(space['backupAvailable'])}"
+                   f" · 每盘预留 {human_size(space['reserveBytes'])}")
+    warning = "\n空间不足，请更改位置后重新预览。" if not space["enough"] else ""
+    return f"{common}\n{volumes}{warning}"
 
 
 def label(text, name=None, wrap=False):
@@ -194,6 +208,7 @@ class MainWindow(QMainWindow):
         self.records = []
         self.record_map = {}
         self.current_record = None
+        self.project_locations = {}
         self.selected = set(self.state.data.get("selection", []))
         self.marks = set(self.state.data.get("marks", []))
         self.source_filter, self.project_filter = "all", "all"
@@ -209,7 +224,23 @@ class MainWindow(QMainWindow):
         self.loading = False
         self._closing = False
         self._build()
-        self.show_welcome()
+        self.history_config = dict(self.state.data.get("history", {}))
+        self.history_config_error = ""
+        if home is None and state_root is None:
+            from .history import discover_reading_root, load_local_config
+            config_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[2] / "local-data"
+            try:
+                local_config = load_local_config(config_dir)
+                self.history_config = {**local_config, **self.history_config}
+            except (OSError, ValueError) as error:
+                self.history_config_error = str(error)
+            if not self.history_config.get("readingRoot"):
+                self.history_config["readingRoot"] = discover_reading_root(self.home)
+        if self.history_config.get("readingRoot"):
+            self.navigate("history")
+            QTimer.singleShot(0, self.history_center.load_sources)
+        else:
+            self.show_welcome()
 
     def _build(self):
         self.setStyleSheet(STYLE)
@@ -229,7 +260,7 @@ class MainWindow(QMainWindow):
         side.addSpacing(22)
         self.nav_group = QButtonGroup(self)
         self.nav_buttons = {}
-        for name, route in [("▤  会话库", "library"), ("▣  备份库", "backups"), ("↶  恢复中心", "recovery"), ("⇄  迁移清单", "transfer"), ("↙  导入记录", "imports")]:
+        for name, route in [("▤  会话库", "library"), ("▧  历史与接手", "history"), ("▣  备份库", "backups"), ("↶  恢复中心", "recovery"), ("⇄  迁移清单", "transfer"), ("↙  导入记录", "imports")]:
             b = button(name, lambda _=False, r=route: self.navigate(r))
             b.setObjectName("Nav")
             b.setCheckable(True)
@@ -290,7 +321,7 @@ class MainWindow(QMainWindow):
 
     def _build_library(self):
         page, layout = self._page("library")
-        self._heading(layout, "会话库", "所有本地记录，在一个地方整理", [button("打开迁移包", self.open_package), button("导入到本机", self.new_import), button("新建备份", self.new_backup, True)])
+        self._heading(layout, "会话库", "所有本地记录，在一个地方整理", [button("打开迁移包", self.open_package), button("导入到本机", self.new_import), button("新建导出", self.new_backup, True)])
         bar = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索会话标题、项目或来源")
@@ -304,6 +335,11 @@ class MainWindow(QMainWindow):
         self.show_children.toggled.connect(self.populate_sessions)
         bar.addWidget(self.show_children)
         bar.addWidget(button("刷新", self.scan))
+        self.prepare_project_button = button("准备项目", self.prepare_projects)
+        self.package_readings_button = button("查看包内 Claude", self.open_package_readings)
+        for extra in (self.prepare_project_button, self.package_readings_button):
+            extra.hide()
+            bar.addWidget(extra)
         layout.addLayout(bar)
         split = QSplitter()
         left = QWidget()
@@ -398,7 +434,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(assurance)
         actions = QHBoxLayout()
         actions.addStretch()
+        actions.addWidget(button("浏览历史与接手稿", lambda: self.navigate("history")))
         actions.addWidget(button("打开已有迁移包", self.open_package))
+        actions.addWidget(button("从移动硬盘恢复", self.open_from_drive))
         actions.addWidget(button("识别本机资料", self.scan, True))
         actions.addStretch()
         layout.addSpacing(16)
@@ -456,6 +494,9 @@ class MainWindow(QMainWindow):
     def apply_catalog(self, catalog):
         self.loading = False
         self.catalog, self.records = catalog, catalog.records
+        data = getattr(self.library, "package_catalog", None) or {}
+        self.prepare_project_button.setVisible(bool(data.get("projects")))
+        self.package_readings_button.setVisible(bool(data.get("readings")))
         self.record_map = {r.uid: r for r in self.records}
         self.source_filter, self.project_filter = "all", "all"
         self.projects.clear()
@@ -723,7 +764,14 @@ class MainWindow(QMainWindow):
         if self.busy and route not in {"progress"}:
             self.error("备份任务仍在运行，请等待或在进度页取消。")
             return
-        if route == "library":
+        if route == "history" and "history" not in self.pages:
+            from .history_gui import HistoryCenter
+            self.history_center = HistoryCenter(self, self.history_config)
+            self.pages["history"] = self.history_center
+            self.stack.addWidget(self.history_center)
+            if self.history_config_error:
+                self.history_center.notice.setText("本地历史配置未读取，请重新选择来源。" + self.history_config_error)
+        elif route == "library":
             if not keep_filters:
                 self.source_filter, self.project_filter = "all", "all"
             self.populate_sessions()
@@ -842,12 +890,84 @@ class MainWindow(QMainWindow):
             return library, catalog
         def done(value):
             self.library, catalog = value
+            self.project_locations = {}
             self.apply_catalog(catalog)
             self.status.setText("迁移包只读预览 · 不写入原客户端 · 数据对象按需校验")
         def failed(message):
             self.loading = False
             self.error(message)
         self.task(load, done, "正在读取迁移包目录", failed)
+
+    def open_from_drive(self):
+        chooser = QDialog(self)
+        chooser.setWindowTitle("从移动硬盘恢复")
+        layout = QVBoxLayout(chooser)
+        layout.addWidget(label("请选择移动硬盘上的备份总目录，或直接打开一份迁移包。", "Info", True))
+        layout.addWidget(button("选择备份总目录", lambda: chooser.done(2)))
+        layout.addWidget(button("打开迁移包", lambda: chooser.done(3), True))
+        choice = chooser.exec()
+        if choice == 2:
+            self.navigate("recovery")
+            self.recovery_center.choose_root()
+        elif choice == 3:
+            self.open_package()
+
+    def prepare_projects(self):
+        if self.busy or self.loading:
+            return
+        from .transfer_gui import ProjectRestore
+        ProjectRestore(self, self.library).exec()
+
+    def open_package_readings(self):
+        if self.busy or self.loading:
+            return
+        from .reading_transfer import materialize_readings
+        from .history_gui import HistoryCenter
+        package = self.library
+        self.loading = True
+
+        def opened(config):
+            self.loading = False
+            dialog = QDialog(self)
+            dialog.setWindowTitle("包内 Claude 历史与接手")
+            dialog.resize(1200, 790)
+            layout = QVBoxLayout(dialog)
+            page = HistoryCenter(self, config, package_mode=True)
+            dialog.finished.connect(lambda *_: page.cancel_handoff())
+            layout.addWidget(page)
+            pending = {uid for uid, data in package.package_catalog.get("readings", {}).items()
+                       if data.get("status") in {"pending", "failed"}}
+            if pending:
+                def retry():
+                    dialog.accept()
+                    self.selected = pending
+                    self.save_selection()
+                    self.new_backup()
+                layout.addWidget(button(f"补生成 {len(pending)} 份接手稿并另存所选会话…", retry, True))
+            page.load_sources()
+            dialog.exec()
+
+        def failed(error):
+            self.loading = False
+            self.error(error)
+        self.task(lambda progress: materialize_readings(package, progress), opened, "正在读取包内 Claude 历史", failed)
+
+    def export_reading_archive(self, config, selection=None):
+        if self.busy or self.loading:
+            return
+        from .reading_transfer import ReadingSource
+        self.loading = True
+        def opened(source):
+            self.library = source
+            self.apply_catalog(source.catalog)
+            if selection:
+                self.selected.add(selection)
+            self.new_backup()
+        def failed(error):
+            self.loading = False
+            self.error(error)
+        self.task(lambda progress: ReadingSource(config, self.state.cache, progress), opened,
+                  "读取已有 Claude 阅读版", failed)
 
     def new_backup(self):
         if self.loading:
@@ -965,7 +1085,7 @@ class MainWindow(QMainWindow):
             self.busy = False; self.error(message)
         self.task(lambda progress: rollback_import(Path(report["journal"]), self.state.cache, confirmed_offline=True, progress=progress), done, "正在检查并恢复目标资料", failed)
 
-    def run_backup(self, records, destination, key_path, include_projects=False):
+    def run_backup(self, records, destination, key_path, include_projects=False, project_choices=None, model=None):
         self.busy = True
         self.cancel = threading.Event()
         page, layout = self._replace_page("progress")
@@ -979,6 +1099,15 @@ class MainWindow(QMainWindow):
         content.addWidget(label(f"{len(records)} 条会话 · {len({r.provider for r in records})} 个来源", "Muted"))
         content.addWidget(label("资料读取 → 原始归档 → 完整性校验 → 加密 → 实际解密回读", "Subheading", True))
         content.addWidget(label("校验与回读通过前不标记完成。取消或失败会保留已有结果与故障记录。", "Info", True))
+        generation_cancel = threading.Event() if model is not None else None
+        if generation_cancel is not None:
+            def stop_generation():
+                generation_cancel.set()
+                stop.setText("已停止后续接手稿生成，继续导出原文")
+                stop.setEnabled(False)
+
+            stop = button("停止生成接手稿，继续备份", stop_generation)
+            content.addWidget(stop)
         content.addWidget(button("取消任务", self.cancel_backup))
         layout.addWidget(frame)
         layout.addStretch()
@@ -990,12 +1119,19 @@ class MainWindow(QMainWindow):
             self.show_result(report)
         def failed(message):
             self.busy = False
-            self.error(message + "\n\n原始资料未改变。输出位置的部分归档和故障记录保留；失败目录可能含临时明文，请保管在私密位置。")
-            if getattr(self, "last_failure_report", None):
-                self.show_result(self.last_failure_report)
+            failure = getattr(self, "last_failure_report", None)
+            if failure and (failure.get("privacyCheck") or {}).get("findings"):
+                self.show_result(failure)
+                return
+            self.error(message + "\n\n请在结果页核对已校验的文件和可重新导出的内容。")
+            if failure:
+                self.show_result(failure)
             else:
                 self.navigate("backups")
-        task = self.task(lambda progress: make_backup(library, records, destination, key_path, progress, self.cancel, {"marks": sorted(self.marks & {r.uid for r in records})}, include_projects), done, "正在创建备份", failed)
+        task = self.task(lambda progress: make_backup(library, records, destination, key_path, progress, self.cancel,
+                         {"marks": sorted(self.marks & {r.uid for r in records})}, include_projects,
+                         project_choices=project_choices, model=model, generation_cancel=generation_cancel),
+                         done, "正在创建备份", failed)
         task.signals.progress.connect(self.backup_update)
 
     def backup_update(self, stage, percent):
@@ -1039,6 +1175,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(label("备份已完成，有需要关注的内容" if complete and warnings else "备份与校验已完成" if complete else "备份尚未完成", "Notice" if warnings or not complete else "Info", True))
         frame, content = card()
         content.addWidget(label(f"{report.get('sessions', 0)} 条会话  ·  {report.get('files', 0)} 个数据对象  ·  {human_size(report.get('bytes') or 0)}", "Section", True))
+        if report.get("handoff"):
+            result = report["handoff"]
+            content.addWidget(label(f"Claude 接手稿 · 复用 {result.get('reused', 0)} · 新生成 {result.get('generated', 0)} · "
+                                    f"待生成 {result.get('pending', 0)} · 失败 {result.get('failed', 0)}", "Info", True))
+        privacy = report.get("privacyCheck") or {}
+        if privacy.get("verified") and privacy.get("opaqueObjects"):
+            content.addWidget(label(f"{privacy['opaqueObjects']} 个非结构化对象已检查已知账号值和凭据特征。", "Muted", True))
         for text in ["逐文件完整性校验：通过" if complete else "逐文件完整性校验：未完成", "实际解密回读：通过" if report.get("encryptedReadbackVerified") else "实际解密回读：未完成", "原始会话与 thinking：未改写", "Windows 原生导入与真实续聊：待目标机验证", "本次为在线快照，不能替代来源退出后的最终备份"]:
             content.addWidget(label(text, "Good" if "通过" in text else "Muted", True))
         actions = QHBoxLayout()
@@ -1048,9 +1191,23 @@ class MainWindow(QMainWindow):
         if report.get("encrypted") and report.get("plainSha256"):
             actions.addWidget(button("校验加密备份", lambda: self.check_encrypted(report)))
         content.addLayout(actions)
+        options = self.backup_version_options(report)
+        if options:
+            content.addWidget(button("设为指定备份的当前版本…", lambda: self.choose_backup_version(report, options)))
+        if report.get("retainedVersion"):
+            content.addWidget(label("旧版保留在 " + report["retainedVersion"], "Info", True))
+            content.addWidget(button("打开保留的旧版本", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(report["retainedVersion"]))))
         layout.addWidget(frame)
+        findings = (report.get("privacyCheck") or {}).get("findings") or []
+        if findings:
+            layout.addWidget(label(f"迁移包账号检查命中 {len(findings)} 项。可排除命中的会话或文件，再从原样保全重建。", "Notice", True))
+            if report.get("encryptedReadbackVerified"):
+                layout.addWidget(button("查看命中项并重建迁移包", lambda: self.review_privacy_findings(report, findings), True))
+        elif complete and report.get("privacyExclusions"):
+            scope = report["privacyExclusions"]
+            layout.addWidget(label(f"重建时已排除 {len(scope['sessions'])} 条会话、{len(scope['objects'])} 个文件和 {len(scope['projects'])} 个项目。", "Info", True))
         if not complete:
-            layout.addWidget(label("未完成的暂存文件可能含明文历史，已保留在该任务目录。请私密保管，不要把它们当作完成的迁移包。", "Notice", True))
+            layout.addWidget(label("结果页仅列出已完成校验的包。可从所选来源重新发起导出。", "Notice", True))
             if report.get("archiveReady") and Path(report.get("pendingArchive", "")).is_file():
                 layout.addWidget(button("继续校验与加密", lambda: self.resume_gui(report), True))
             layout.addWidget(button("重新创建备份（保留旧任务）", self.new_backup))
@@ -1062,6 +1219,186 @@ class MainWindow(QMainWindow):
         else:
             layout.addStretch()
         self.stack.setCurrentWidget(page)
+
+    def backup_version_options(self, incoming):
+        from .backup_versions import paired_backup
+        if not paired_backup(incoming):
+            return []
+        candidate = Path(incoming["output"])
+        return [row for row in self.state.data.get("backups", []) if paired_backup(row)
+                and Path(row["output"]) != candidate and Path(row["output"]).parent == candidate.parent]
+
+    def choose_backup_version(self, incoming, options):
+        if self.busy or not options:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("选择要更新的备份")
+        dialog.resize(700, 340)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(label("新版 " + incoming["output"], "Section", True))
+        layout.addWidget(label("请选择新版要接管的现有目录。该目录中的旧迁移包、加密保全和其他文件会整份保留在同盘。", "Info", True))
+        targets = QComboBox()
+        targets.addItem("选择要更新的旧备份…", None)
+        for prior in options:
+            targets.addItem(f"{Path(prior['output']).name} · {prior.get('sessions', 0)} 条会话", prior)
+        layout.addWidget(targets)
+        path = label("", "Muted", True)
+        layout.addWidget(path)
+        controls = QHBoxLayout()
+        cancel = button("返回", dialog.reject)
+        cancel.setDefault(True)
+        controls.addWidget(cancel)
+        controls.addStretch()
+        submit = button("校验并切换到新版", dialog.accept, True)
+        submit.setEnabled(False)
+        submit.setAutoDefault(False)
+        controls.addWidget(submit)
+        layout.addLayout(controls)
+
+        def changed():
+            selected = targets.currentData()
+            path.setText(selected["output"] if selected else "")
+            submit.setEnabled(bool(selected))
+
+        targets.currentIndexChanged.connect(changed)
+        if dialog.exec() == QDialog.DialogCode.Accepted and targets.currentData():
+            self.activate_backup_version(incoming, targets.currentData())
+
+    def activate_backup_version(self, incoming, prior):
+        from .backup_versions import switch_backup_version
+        if self.busy:
+            return
+        key = incoming.get("keyPath")
+        if not key or not Path(key).is_file():
+            key, _ = QFileDialog.getOpenFileName(self, "选择新版备份的恢复密钥", "", "恢复密钥 (*.asmkey)")
+        if not key:
+            return
+        self.busy = True
+        self.cancel = threading.Event()
+        page, layout = self._replace_page("progress")
+        self._heading(layout, "切换备份版本", "先逐项回读新版和密钥，再保留旧目录并切换")
+        self.backup_stage = label("正在准备校验", "Section")
+        self.backup_progress = QProgressBar()
+        layout.addWidget(self.backup_stage)
+        layout.addWidget(self.backup_progress)
+        layout.addWidget(button("取消校验", self.cancel_backup))
+        layout.addStretch()
+        self.stack.setCurrentWidget(page)
+
+        def done(result):
+            self.busy = False
+            active, retained = result
+            self.state.record_backup_switch(incoming["output"], active, retained)
+            self.show_result(active)
+
+        def failed(error):
+            self.busy = False
+            self.error(error)
+            self.show_result(incoming)
+
+        task = self.task(lambda progress: switch_backup_version(incoming, prior, Path(key), self.state.cache, progress, self.cancel),
+                         done, "正在准备切换备份版本", failed)
+        task.signals.progress.connect(self.backup_update)
+
+    def review_privacy_findings(self, report, findings):
+        if self.busy:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("查看账号检查命中项")
+        dialog.resize(750, 530)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(label("选择要从迁移副本排除的项目文件或会话。已校验的加密保全可继续打开和校验。", "Info", True))
+        listing = QListWidget()
+        layout.addWidget(listing, 1)
+        grouped = {}
+        for hit in findings:
+            owners = hit.get("sessions", [])
+            locator = hit["locator"]
+            role = hit["role"]
+            if role in {"project-work-file", "project-local-change"} and locator.startswith("objects/"):
+                action = ("objects", (locator,))
+                subject = "排除项目文件 " + hit.get("projectPath", locator)
+            elif role == "project-metadata" and hit.get("projectRef"):
+                action = ("projects", (hit["projectRef"],))
+                subject = "排除此项目资料及关联"
+            elif owners:
+                action = ("sessions", tuple(owner["ref"] for owner in owners))
+                subject = "排除 " + "、".join(f"{PROVIDERS.get(item['provider'], '会话')} #{item['number']}" for item in owners)
+            else:
+                action = None
+                subject = "需另选导出范围"
+            target = f"{locator} 第 {hit['line']} 行" if hit.get("line") else locator
+            fields = "、".join(hit.get("fields", ())) or hit.get("field", "")
+            details = f"{fields} · {hit['category']}" if fields else hit["category"]
+            if action is None:
+                listing.addItem(f"{subject} · {target} · {details}")
+            else:
+                group = grouped.setdefault(action, [subject, []])
+                group[1].append(f"{target} · {details}")
+        for action, (subject, positions) in grouped.items():
+            sample = "\n".join(dict.fromkeys(positions[:3]))
+            suffix = f" 等 {len(positions)} 项" if len(positions) > 3 else ""
+            item = QListWidgetItem(f"{subject}{suffix}\n{sample}")
+            item.setData(Qt.ItemDataRole.UserRole, action)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            listing.addItem(item)
+        actions = QHBoxLayout()
+        cancel = button("返回", dialog.reject)
+        cancel.setDefault(True)
+        actions.addWidget(cancel)
+        actions.addStretch()
+        proceed = button("按所选范围重建迁移包", dialog.accept, True)
+        proceed.setAutoDefault(False)
+        proceed.setEnabled(bool(grouped))
+        listing.itemChanged.connect(lambda _: proceed.setEnabled(any(
+            listing.item(i).checkState() == Qt.CheckState.Checked for i in range(listing.count())
+        )))
+        actions.addWidget(proceed)
+        layout.addLayout(actions)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        exclusions = {name: set() for name in ("sessions", "objects", "projects")}
+        for i in range(listing.count()):
+            item = listing.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                kind, refs = item.data(Qt.ItemDataRole.UserRole)
+                exclusions[kind].update(refs)
+        self.rebuild_from_preservation(report, exclusions)
+
+    def rebuild_from_preservation(self, report, exclusions):
+        key = report.get("keyPath")
+        if not key or not Path(key).is_file():
+            key, _ = QFileDialog.getOpenFileName(self, "选择原样保全的恢复密钥", "", "恢复密钥 (*.asmkey)")
+        if not key:
+            return
+        self.busy = True
+        self.cancel = threading.Event()
+        page, layout = self._replace_page("progress")
+        self._heading(layout, "重建迁移包", "从已通过回读的原样加密保全中提取所选资料")
+        self.backup_stage = label("正在核对已加密快照", "Section")
+        self.backup_progress = QProgressBar()
+        layout.addWidget(self.backup_stage)
+        layout.addWidget(self.backup_progress)
+        layout.addWidget(button("取消任务", self.cancel_backup))
+        layout.addStretch()
+        self.stack.setCurrentWidget(page)
+
+        def done(result):
+            self.busy = False
+            self.state.record_backup(result)
+            self.show_result(result)
+
+        def failed(message):
+            self.busy = False
+            updated = self.last_failure_report or report
+            if not (updated.get("privacyCheck") or {}).get("findings") or updated is report:
+                self.error(message)
+            self.show_result(updated)
+
+        task = self.task(lambda progress: rebuild_portable(report, Path(key), exclusions, progress, self.cancel),
+                         done, "正在重建迁移包", failed)
+        task.signals.progress.connect(self.backup_update)
 
     def resume_gui(self, report):
         if self.busy:
@@ -1132,7 +1469,7 @@ class MainWindow(QMainWindow):
             self.state.save()
             cache_label.setText(str(target))
         layout.addWidget(button("更改缓存位置", change))
-        layout.addWidget(label("缓存只用于独立副本和迁移包预览，不向原客户端写入资料。", "Info", True))
+        layout.addWidget(label("缓存可放在移动硬盘。更改位置后，重新扫描本机资料或重新打开迁移包即可使用新位置。", "Info", True))
         layout.addWidget(button("关闭", dialog.accept))
         dialog.exec()
 
@@ -1177,6 +1514,7 @@ class ImportWizard(QDialog):
         self.resize(1040, 780)
         self.step = 0
         self.plan = None
+        self.space = []
         self.working = False
         self.preview_cancel = threading.Event()
         self.target_fields, self.mapping_fields = {}, {}
@@ -1191,6 +1529,11 @@ class ImportWizard(QDialog):
         for record in owner.records:
             item = QListWidgetItem(PROVIDERS[record.provider] + " · " + record.title)
             item.setData(Qt.ItemDataRole.UserRole, record.uid)
+            if record.provider not in NATIVE_PROVIDERS:
+                item.setText(item.text() + " · 只读接手")
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsUserCheckable)
+                self.choices.addItem(item)
+                continue
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if record.uid in owner.selected else Qt.CheckState.Unchecked)
             self.choices.addItem(item)
@@ -1200,7 +1543,7 @@ class ImportWizard(QDialog):
         row.addWidget(button("选择全部", lambda: self.choose_all(True)))
         row.addWidget(button("清除选择", lambda: self.choose_all(False)))
         row.addStretch(); f.addLayout(row)
-        f.addWidget(label("Claude 仅恢复本地 Claude Code 历史，不是云端聊天导入。Codex 目标需先由原客户端初始化数据库，再正常退出。", "Muted", True))
+        f.addWidget(label("Claude 历史可在会话库阅读。Codex 与 DSH 导入前需初始化目标客户端。", "Muted", True))
         self.pages.addWidget(first)
         second = QWidget(); s = QVBoxLayout(second)
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
@@ -1208,34 +1551,33 @@ class ImportWizard(QDialog):
         self.paths_layout.addWidget(label("选择原客户端的资料目录", "Section"))
         variables = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "deepseek": "DSH_HOME"}
         folders = {"claude": ".claude", "codex": ".codex", "deepseek": ".dsh"}
-        for provider, name in PROVIDERS.items():
+        for provider in sorted(NATIVE_PROVIDERS):
+            name = PROVIDERS[provider]
             self.paths_layout.addWidget(label(name, "Muted"))
             field = QLineEdit(str(Path(os.environ.get(variables[provider], str(owner.home / folders[provider]))).expanduser()))
             self.target_fields[provider] = field
             self._directory_row(self.paths_layout, field, "选择 " + name + " 目标资料目录")
-        self.paths_layout.addWidget(label("Claude Desktop Code 索引目录（可选）", "Muted"))
-        desktop = QLineEdit()
-        desktop.setPlaceholderText("选择目标账号下 local_*.json 所在目录；留空仅恢复 Code 本地日志")
-        self.target_fields["claude_desktop"] = desktop
-        self._directory_row(self.paths_layout, desktop, "选择 Claude Desktop Code 目标索引容器")
         self.paths_layout.addWidget(label("项目路径映射", "Section"))
         self.paths_layout.addWidget(label("选择目标机已有的项目文件夹。这里仅映射会话归属，不写入、替换或执行项目工作文件。", "Muted", True))
-        for cwd in sorted({r.cwd for r in owner.records}):
+        from .transfer_gui import mapped_project
+        rows = {r.cwd: r for r in owner.records if r.provider in NATIVE_PROVIDERS}
+        for cwd, record in sorted(rows.items()):
             self.paths_layout.addWidget(label(cwd or "原会话未记录项目", "Muted", True))
             default = cwd if cwd and Path(cwd).is_absolute() and Path(cwd).is_dir() and not cwd.startswith(("\\\\", "//")) else ""
-            field = QLineEdit(default)
+            field = QLineEdit(mapped_project(record, owner.project_locations) or default)
             field.setPlaceholderText("选择目标机已存在的项目目录")
             self.mapping_fields[cwd] = field
             self._directory_row(self.paths_layout, field, "选择目标项目目录")
         self.paths_layout.addWidget(label("目标资料完整备份与恢复记录位置", "Section"))
         self.destination = QLineEdit(str(owner.state.root / "导入备份"))
         self._directory_row(self.paths_layout, self.destination, "选择目标完整备份位置")
-        self.paths_layout.addWidget(label("请先退出目标原客户端及后台任务再预览；目标变化会使预览失效。恢复需要目标磁盘有一份独立副本空间，备份位置另需完整目标资料空间。", "Notice", True))
+        self.paths_layout.addWidget(label("预览后，写入前请退出参与恢复的客户端及后台任务。目标变化后需要重新预览。", "Notice", True))
         self.paths_layout.addStretch(); scroll.setWidget(holder); s.addWidget(scroll)
         self.pages.addWidget(second)
         third = QWidget(); t = QVBoxLayout(third)
         self.summary = label("尚未预览", "Section", True); t.addWidget(self.summary)
         self.preview = QListWidget(); t.addWidget(self.preview, 1)
+        self.space_notice = label("", "Muted", True); t.addWidget(self.space_notice)
         self.preview_notice = label("预览不会导入会话。", "Info", True); t.addWidget(self.preview_notice)
         self.offline = QCheckBox("我已正常退出所选目标客户端及其后台任务，并会保持退出直到导入完成")
         self.private_backup = QCheckBox("我理解完整目标备份含私密资料且未加密，已选择私密且空间充足的位置")
@@ -1257,16 +1599,22 @@ class ImportWizard(QDialog):
         row.addWidget(button("选择目录", choose)); layout.addLayout(row)
 
     def selected(self):
-        return [self.owner.record_map[self.choices.item(i).data(Qt.ItemDataRole.UserRole)] for i in range(self.choices.count()) if self.choices.item(i).checkState() == Qt.CheckState.Checked]
+        return [self.owner.record_map[item.data(Qt.ItemDataRole.UserRole)] for i in range(self.choices.count())
+                if (item := self.choices.item(i)).flags() & Qt.ItemFlag.ItemIsUserCheckable
+                and item.checkState() == Qt.CheckState.Checked]
 
     def choose_all(self, on):
         for i in range(self.choices.count()):
-            self.choices.item(i).setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+            item = self.choices.item(i)
+            if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                item.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
 
     def update_gate(self, *_):
         if not hasattr(self, "next"):
             return
-        enabled = bool(self.selected()) if self.step == 0 else True if self.step == 1 else bool(self.plan and self.plan.ready and self.offline.isChecked() and self.private_backup.isChecked())
+        enabled = bool(self.selected()) if self.step == 0 else True if self.step == 1 else bool(
+            self.plan and self.plan.ready and all(volume["enough"] for volume in self.space)
+            and self.offline.isChecked() and self.private_backup.isChecked())
         self.next.setEnabled(enabled and not self.working)
         self.previous.setEnabled(True)
 
@@ -1280,7 +1628,7 @@ class ImportWizard(QDialog):
         self.step -= 1; self.pages.setCurrentIndex(self.step)
         self.previous.setText("取消" if self.step == 0 else "上一步")
         self.next.setText("下一步" if self.step == 0 else "预览冲突")
-        self.plan = None; self.error_notice.setText(""); self.update_gate()
+        self.plan = None; self.space = []; self.error_notice.setText(""); self.update_gate()
 
     def forward(self):
         if self.working:
@@ -1297,9 +1645,10 @@ class ImportWizard(QDialog):
             self.previous.setText("取消检查")
             self.pages.setEnabled(False)
             self.error_notice.setText("正在校验迁移包并检查目标资料，不写入客户端…")
-            def done(plan):
+            def done(result):
+                plan, space = result
                 self.working = False; self.owner.loading = False; self.pages.setEnabled(True)
-                self.plan = plan; self.step = 2; self.pages.setCurrentIndex(2)
+                self.plan = plan; self.space = space; self.step = 2; self.pages.setCurrentIndex(2)
                 self.previous.setText("上一步")
                 self.next.setText("备份目标并导入"); self.error_notice.setText("")
                 self.summary.setText(f"可新增 {len(plan.ready)} 条 · 跳过或阻止 {len(plan.items) - len(plan.ready)} 条")
@@ -1311,6 +1660,7 @@ class ImportWizard(QDialog):
                         text += "\n目标：" + plan.targets[item["record"]["provider"]] + "\n项目：" + item["cwd"]
                     self.preview.addItem(text)
                 self.preview_notice.setText("目标备份位置：" + self.destination.text() + "\n\n" + "\n".join(plan.warnings))
+                self.show_import_space()
                 self.offline.setChecked(False); self.private_backup.setChecked(False); self.update_gate()
             def failed(message):
                 self.working = False; self.owner.loading = False; self.pages.setEnabled(True)
@@ -1318,9 +1668,10 @@ class ImportWizard(QDialog):
                 self.error_notice.setText(message); self.update_gate()
             destination_value = Path(self.destination.text().strip())
             def inspect(progress):
-                plan = build_plan(self.owner.library, selected, targets, mapping, self.owner.state.cache, progress, self.preview_cancel)
-                validate_backup_location(plan, destination_value, self.owner.state.cache)
-                return plan
+                library = self.owner.library
+                plan = build_plan(library, selected, targets, mapping, self.owner.state.cache, progress, self.preview_cancel)
+                destination = validate_backup_location(plan, destination_value, self.owner.state.cache)
+                return plan, preview_import_space(plan, library, destination)
             task = self.owner.task(inspect, done, "正在预览导入冲突", failed)
             task.signals.progress.connect(lambda stage, percent: self.error_notice.setText(stage + "  " + str(percent) + "%"))
             return
@@ -1328,6 +1679,23 @@ class ImportWizard(QDialog):
             return
         plan = self.plan; destination = Path(self.destination.text().strip())
         self.accept(); self.owner.run_import(plan, destination)
+
+    def show_import_space(self):
+        lines = []
+        for volume in self.space:
+            roles = []
+            if volume["stagingBytes"] or volume["incomingBytes"]:
+                roles.append(f"目标暂存 {human_size(volume['stagingBytes'] + volume['incomingBytes'])}")
+            if volume["backupBytes"]:
+                roles.append(f"完整目标备份 {human_size(volume['backupBytes'])}")
+            summary = " + ".join(roles) or "目标备份与恢复记录"
+            lines.append(f"{volume['locations'][0]} · {summary}\n"
+                         f"含预留约需 {human_size(volume['estimatedBytes'])} · 可用 {human_size(volume['availableBytes'])}")
+        if any(not volume["enough"] for volume in self.space):
+            lines.append("目标暂存或完整备份空间不足，请更改位置后重新预览。")
+        elif any(volume["availableBytes"] < volume["estimatedBytes"] for volume in self.space):
+            lines.append("可用空间低于含新会话的估算，实际写入前会再次检查。")
+        self.space_notice.setText("\n".join(lines))
 
     def reject(self):
         if not self.working:
@@ -1342,6 +1710,7 @@ class BackupWizard(QDialog):
         self.resize(1000, 720)
         self.step = 0
         self.key_path = None
+        self.estimate_cancel = None
         outer = QVBoxLayout(self)
         outer.setContentsMargins(26, 23, 26, 22)
         outer.addWidget(label("新建备份", "Heading"))
@@ -1354,8 +1723,6 @@ class BackupWizard(QDialog):
         f.addWidget(label("选择需要保留的会话", "Section"))
         self.choices = QListWidget()
         for record in owner.records:
-            if record.child and record.uid not in owner.selected:
-                continue
             item = QListWidgetItem(record.title + "\n" + PROVIDERS[record.provider] + " · " + record.project)
             item.setData(Qt.ItemDataRole.UserRole, record)
             item.setCheckState(Qt.CheckState.Checked if record.uid in owner.selected else Qt.CheckState.Unchecked)
@@ -1383,8 +1750,11 @@ class BackupWizard(QDialog):
         l.addLayout(row)
         s.addWidget(location)
         self.include_projects = QCheckBox("同时保存会话工作目录文件（可选，可能较大）")
+        self.include_projects.setVisible(isinstance(owner.library, PackageLibrary))
+        self.project_choices = {}
+        self.prepared_selection = ()
+        self.generator = None
         s.addWidget(self.include_projects)
-        s.addWidget(label("保存会话工作目录中的未提交和未跟踪文件；不含其他关联根目录、Git 元数据、依赖缓存、独立凭据与密钥。", "Muted", True))
         key, k = card()
         k.addWidget(label("恢复密钥 · 单独保存", "Section"))
         k.addWidget(label("密钥用于恢复加密备份。请保存在本机或其他位置，不要放进备份文件夹。", "Muted", True))
@@ -1405,10 +1775,15 @@ class BackupWizard(QDialog):
         t.addWidget(label("确认并创建在线快照", "Section"))
         self.final_summary = label("", "Subheading", True)
         t.addWidget(self.final_summary)
-        t.addWidget(label("会生成：\n\n• 加密的所选会话保全备份\n• Windows 会话迁移包\n• 实际校验结果与文件清单", "Info", True))
-        t.addWidget(label("首版在来源仍运行时创建在线快照。每个文件取得稳定副本、数据库在私有副本上读取，但不构成全应用同一时点的冷备份。不会关闭应用、恢复旧任务或调用模型。", "Notice", True))
+        self.space_summary = label("", "Info", True)
+        t.addWidget(self.space_summary)
+        t.addWidget(label("来源运行时取得逐文件和逐库快照。接手稿按已选模型与确认的对话生成。", "Notice", True))
         self.project_summary = label("", "Muted", True)
         t.addWidget(self.project_summary)
+        self.project_sizes = QListWidget()
+        self.project_sizes.setMaximumHeight(130)
+        self.project_sizes.hide()
+        t.addWidget(self.project_sizes)
         t.addWidget(label("子任务与审批记录是独立会话，如需一并保全，请在列表中勾选。", "Muted", True))
         t.addWidget(label("Windows 原生导入、账号/供应商兼容与真实续聊将在目标电脑另行验证。", "Muted", True))
         t.addStretch()
@@ -1472,32 +1847,141 @@ class BackupWizard(QDialog):
         if self.step == 0:
             self.next.setEnabled(count > 0)
         elif self.step == 1:
-            self.next.setEnabled(bool(self.destination.text()) and self.key_path is not None and self.key_confirm.isChecked())
+            self.next.setEnabled(self.estimate_cancel is None and bool(self.destination.text()) and self.key_path is not None and self.key_confirm.isChecked())
         else:
             self.next.setEnabled(True)
 
     def back(self):
+        if self.estimate_cancel is not None:
+            self.estimate_cancel.set()
+            return
         if self.step == 0:
             self.reject()
             return
         self.step -= 1
         self.pages.setCurrentIndex(self.step)
+        if self.step == 0:
+            self.prepared_selection = ()
+            self.generator = None
         self.previous.setText("取消" if self.step == 0 else "上一步")
         self.next.setText("下一步")
         self.update_gate()
 
     def forward(self):
+        records = self.selected()
+        if self.step == 1:
+            if self.next.isEnabled():
+                self.preview_space(records)
+            return
+        signature = tuple(r.uid for r in records)
+        if self.step == 0 and signature and self.prepared_selection != signature:
+            from .transfer_gui import ExportOptions
+            from .work_projects import discover_projects
+            self.setEnabled(False)
+            library = self.owner.library
+
+            def done(projects):
+                self.setEnabled(True)
+                data = getattr(library, "package_catalog", None) or {}
+                readings = data.get("readings", {})
+                drafts = sum(bool(readings.get(r.uid, {}).get("draft")) for r in records)
+                if hasattr(library, "readings"):
+                    drafts = sum(r.session_id in library.readings.prompts and not r.child for r in records)
+                choices = ExportOptions(self.owner, projects, records, self.project_choices, drafts)
+                if choices.exec() == QDialog.DialogCode.Accepted:
+                    self.project_choices = choices.values()
+                    self.generator = choices.model
+                    self.prepared_selection = signature
+                    self.advance()
+
+            def failed(error):
+                self.setEnabled(True)
+                self.owner.error(error)
+            self.owner.task(lambda _: discover_projects(records, library.home), done, "正在核对共享项目", failed)
+            return
+        self.advance()
+
+    def preview_space(self, records):
+        library = self.owner.library
+        destination = Path(self.destination.text())
+        key = self.key_path
+        include = self.include_projects.isChecked()
+        choices = dict(self.project_choices)
+        cancel = threading.Event()
+        self.estimate_cancel = cancel
+        self.pages.setEnabled(False)
+        self.next.setText("正在估算空间…")
+        self.previous.setText("停止估算")
+        self.update_gate()
+
+        def reset():
+            self.estimate_cancel = None
+            self.pages.setEnabled(True)
+            self.previous.setText("上一步")
+            self.next.setText("下一步")
+            self.update_gate()
+
+        def done(estimate):
+            reset()
+            if cancel.is_set():
+                return
+            self.show_space_estimate(estimate)
+            self.advance()
+
+        def failed(error):
+            reset()
+            if not cancel.is_set():
+                self.owner.error(error)
+
+        self.owner.task(lambda _: estimate_backup(library, records, destination, key, include, choices, cancel),
+                        done, "正在统计项目文件与备份位置空间", failed)
+
+    def reject(self):
+        if self.estimate_cancel is not None:
+            self.estimate_cancel.set()
+            return
+        super().reject()
+
+    def show_space_estimate(self, estimate):
+        def size(key):
+            return human_size(estimate[key])
+        if estimate["sameVolume"]:
+            total = estimate["outputRequired"] + estimate["cacheTemporaryBytes"]
+            volume = f"保存位置与缓存同盘 · 估计共需 {human_size(total)} · 可用 {size('outputFree')}"
+        else:
+            volume = (f"保存位置约需 {size('outputRequired')} · 可用 {size('outputFree')}\n"
+                      f"缓存位置约需 {size('cacheRequired')} · 可用 {size('cacheFree')}")
+        warning = "\n估算需求高于当前可用空间，可返回更改保存位置或在设置中换缓存。" if not estimate["enough"] else ""
+        self.space_summary.setText(
+            f"迁移包约 {size('portableBytes')} · 加密保全约 {size('encryptedBytes')}\n"
+            f"保存位置临时文件约 {size('outputTemporaryBytes')} · 缓存临时资料约 {size('cacheTemporaryBytes')}\n"
+            f"{volume}\n缓存位置 {estimate['cache']}\n"
+            f"根据当前文件估算。实际体积受压缩、历史数据库导出、附件和在线变化影响。{warning}"
+        )
+        self.project_sizes.clear()
+        names = {"link": "仅关联", "files": "随包工作文件", "git": "Git 本地改动"}
+        for project in estimate["projects"]:
+            self.project_sizes.addItem(
+                f"{project['title']} · {names.get(project['mode'], project['mode'])} · "
+                f"{project['files']} 个文件 · {human_size(project['bytes'])}"
+            )
+        self.project_sizes.setVisible(bool(estimate["projects"]))
+
+    def advance(self):
         if self.step < 2:
             self.step += 1
             self.pages.setCurrentIndex(self.step)
             self.previous.setText("上一步")
             self.next.setText("开始备份" if self.step == 2 else "下一步")
             self.final_summary.setText(f"{len(self.selected())} 条会话\n\n保存到：{self.destination.text()}\n\n恢复密钥：{self.key_path}")
-            self.project_summary.setText("包含关联项目工作文件；不含 Git 元数据、依赖缓存和独立凭据。原项目文件仍保留在 Mac。" if self.include_projects.isChecked() else "本次只保存项目归属信息，不包含项目工作文件。需要时可返回上一步勾选。")
+            count = sum(choice[0] in {"files", "git"} for choice in self.project_choices.values())
+            self.project_summary.setText(f"按所选方案处理 {count} 个项目，其他项目可在目标机重新关联。" if not self.include_projects.isChecked() else "保留包内选中会话关联的项目资料。")
             self.update_gate()
             return
         selected = self.selected()
         self.owner.selected.update(r.uid for r in selected)
         self.owner.save_selection()
+        generator, self.generator = self.generator, None
         self.accept()
-        self.owner.run_backup(selected, Path(self.destination.text()), self.key_path, self.include_projects.isChecked())
+        self.owner.run_backup(selected, Path(self.destination.text()), self.key_path, self.include_projects.isChecked(),
+                              self.project_choices, generator)

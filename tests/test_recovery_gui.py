@@ -130,7 +130,9 @@ class RecoveryGuiTest(unittest.TestCase):
         def build(catalog, item_ids, group_ids, target, backup, **kwargs):
             calls.append(('build', item_ids, group_ids))
             return dict(id='plan', target=str(target), backupRoot=str(backup), new=1, skip=1,
-                blocked=1, bytes=10, selected=3, database='fixture.sqlite')
+                blocked=1, bytes=10, selected=3, database='fixture.sqlite',
+                space=dict(sameVolume=True, enough=True, targetBytes=10, backupBytes=20,
+                           reserveBytes=100, targetAvailable=500, backupAvailable=500))
         def rows(plan, offset=0, limit=200):
             return [dict(id=str(i), path=f'file-{i}', destination=f'target/file-{i}', status=status,
                 reason='fixture reason', size=10) for i, status in enumerate(['new', 'skip', 'blocked'])]
@@ -146,6 +148,7 @@ class RecoveryGuiTest(unittest.TestCase):
         with patch.dict('sys.modules', {'ai_session_migration.file_restore': api}):
             self.page.preview(); self.wait_tasks()
             self.assertEqual(self.page.plan_list.count(), 3)
+            self.assertIn('同盘约需 130 B', self.page.summary.text())
             self.assertFalse(self.page.restore_button.isEnabled())
             self.page.restore()
             self.assertEqual(len(calls), 1)

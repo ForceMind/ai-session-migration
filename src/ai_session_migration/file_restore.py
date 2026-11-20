@@ -17,6 +17,7 @@ import uuid
 
 from .backup import Cancelled, check_cancel
 from .importer import rename_new, target_locks
+from .migration_policy import forbid_client_storage
 from .safeio import CHUNK, atomic_json, hash_file, remote_path, stable_bytes, within
 
 SCHEMA = 'asm-file-restore-1'
@@ -53,17 +54,12 @@ def _overlap(a, b):
 
 def _locations(catalog, target, backup):
     target, backup = _directory(target), _directory(backup)
+    forbid_client_storage(target)
+    forbid_client_storage(backup)
     cache = Path(catalog.cache).resolve()
     root = Path(getattr(catalog, 'root', getattr(catalog, 'bundle_root', cache))).resolve()
     if _overlap(target, backup) or any(_overlap(target, p) or _overlap(backup, p) for p in [root, cache]):
         raise ValueError('恢复目标、目标备份、源备份与工具缓存必须分开，不能互相包含')
-    home = Path.home()
-    live = [home/x for x in ['.claude', '.codex', '.dsh']]
-    for base in [home/'Library/Application Support', Path(os.environ.get('APPDATA', home/'AppData/Roaming')), Path(os.environ.get('LOCALAPPDATA', home/'AppData/Local'))]:
-        live += [base/'Claude', base/'Codex']
-        if base.is_dir():live += list(base.glob('Claude-*'))
-    if any(within(target, p) or target == p.resolve() for p in live):
-        raise ValueError('应用资料只能提取到独立文件夹；原生会话请使用会话导入向导')
     return target, backup, cache
 
 
@@ -90,6 +86,8 @@ def _relative(item):
     if not parts and item.get('kind') != 'directory':raise ValueError('文件缺少名称')
     if item.get('kind') == 'symlink':
         parts[-1] += '.symlink.json'
+    if item.get("layout") == "project":
+        return Path(*parts)
     return Path('资料-'+_component(str(item['group_id']))[:80], *parts)
 
 
@@ -104,8 +102,27 @@ def _connect(path):
 
 
 def _parent_space(p):
-    while not p.exists():p=p.parent
+    while not p.is_dir():
+        if p.parent == p:
+            raise ValueError('恢复位置或备份所在磁盘不可用，请重新连接后预览')
+        p=p.parent
     return shutil.disk_usage(p).free, p.stat().st_dev
+
+
+def file_restore_space(plan, backup_bytes):
+    target_free, target_dev = _parent_space(Path(plan['target']))
+    backup_free, backup_dev = _parent_space(Path(plan['backupRoot']))
+    target_bytes = plan['bytes'] + plan['selected'] * 4096
+    same_volume = target_dev == backup_dev
+    if same_volume:
+        available = min(target_free, backup_free)
+        target_free = backup_free = available
+        enough = available >= target_bytes + backup_bytes + RESERVE
+    else:
+        enough = target_free >= target_bytes + RESERVE and backup_free >= backup_bytes + RESERVE
+    return {'targetBytes': target_bytes, 'backupBytes': backup_bytes, 'reserveBytes': RESERVE,
+            'targetAvailable': target_free, 'backupAvailable': backup_free,
+            'sameVolume': same_volume, 'enough': enough}
 
 
 def _snapshot(root, cancel):
@@ -186,6 +203,8 @@ def build_file_plan(catalog, item_ids, group_ids, target, backup_root, progress=
                 db.commit();progress('生成逐项恢复与冲突预览',0)
                 if _parent_space(path.parent)[0]<RESERVE:raise ValueError('工具缓存空间不足，请更换缓存目录')
         if not plan['selected']:raise ValueError('请先勾选至少一项资料')
+        backup_bytes=db.execute('SELECT coalesce(sum(size),0) FROM before_files WHERE kind="file"').fetchone()[0]
+        plan['space']=file_restore_space(plan,backup_bytes)
         db.execute('INSERT INTO meta VALUES(?)',(json.dumps(plan),));db.commit()
         progress('恢复预览已生成',100)
         return plan
@@ -263,6 +282,7 @@ def _backup_target(db, plan, output, cancel, progress):
 
 def _load_report(value):
     path=Path(value['journal'] if isinstance(value,dict) else value)
+    forbid_client_storage(path.parent)
     if path.is_symlink():raise ValueError('恢复日志不能是链接')
     report=json.loads(stable_bytes(path,4*CHUNK))
     if report.get('schema')!=SCHEMA or Path(report['journal']).resolve()!=path.resolve() or Path(report['output']).resolve()!=path.parent.resolve():raise ValueError('不是受支持的文件恢复记录')
@@ -290,9 +310,7 @@ def execute_file_restore(catalog,plan,progress=lambda *_:None,cancel=None):
                 raise RestoreFailure('此计划已执行；请检查恢复记录或重新预览，现有文件不会覆盖',checked)
             _before_same(db,target,plan['targetExisted'],cancel)
             needed=db.execute('SELECT coalesce(sum(size),0) FROM before_files WHERE kind="file"').fetchone()[0]
-            free_target,device_target=_parent_space(target);free_backup,device_backup=_parent_space(backup)
-            overhead=plan['selected']*4096
-            if free_target<plan['bytes']+overhead+RESERVE or free_backup<needed+RESERVE or device_target==device_backup and free_target<plan['bytes']+needed+overhead+RESERVE:
+            if not file_restore_space(plan,needed)['enough']:
                 raise ValueError('恢复或目标完整备份空间不足，未修改目标')
             backup.mkdir(parents=True,exist_ok=True,mode=0o700)
             output=backup/('文件恢复-'+time.strftime('%Y%m%d-%H%M%S')+'-'+plan['id'][:10]);output.mkdir(mode=0o700)
@@ -308,7 +326,7 @@ def execute_file_restore(catalog,plan,progress=lambda *_:None,cancel=None):
                 total=max(1,plan['new'])
                 for row in db.execute('SELECT * FROM rows WHERE status="new" ORDER BY rowid'):
                     check_cancel(cancel);item=json.loads(row['item']);current=dict(catalog.get_item(row['id']))
-                    if any(current.get(k)!=item.get(k) for k in ['group_id','path','kind','size','sha256']):raise ValueError('源条目在预览后变化，请重新预览')
+                    if any(current.get(k)!=item.get(k) for k in ['group_id','path','kind','size','sha256','layout']):raise ValueError('源条目在预览后变化，请重新预览')
                     dest=Path(row['destination']);_guard_parent(dest,target)
                     if dest!=target/_relative(item):raise ValueError('计划中的目标路径与所选源条目不一致')
                     if dest.exists():
@@ -377,6 +395,7 @@ def rollback_file_restore(value,progress=lambda *_:None):
     path,report=_load_report(value);db=_connect(report['planDatabase']);protected=[];removed=0
     try:
         target=_directory(report['target'])
+        forbid_client_storage(target)
         with target_locks({'files':str(target)},Path(json.loads(db.execute('SELECT value FROM meta').fetchone()[0])['cache'])):
             for row in db.execute('SELECT id,destination,digest,phase,item FROM rows WHERE phase IN ("publishing","verified") ORDER BY rowid DESC'):
                 dest=Path(row['destination']);_guard_parent(dest,target)

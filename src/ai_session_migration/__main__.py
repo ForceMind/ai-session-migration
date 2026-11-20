@@ -22,32 +22,112 @@ from .safeio import atomic_json, within
 def synthetic_import_acceptance(window):
     """Packaged-program qualification on pre-created, isolated synthetic homes only."""
     from .backup import make_backup, save_recovery_key
+    from .file_restore import build_file_plan, execute_file_restore, rollback_file_restore
+    from .history import ReadingCatalog, load_prompts
+    from .migration_policy import CLAUDE_READ_ONLY, NATIVE_PROVIDERS
     from .packages import PackageLibrary
     from .importer import build_plan, execute_import, rollback_import, inventory
+    from .reading_transfer import materialize_readings
     from .safeio import hash_file
+    from .transfer_gui import mapped_project
+    from .work_projects import discover_projects, ProjectView
+
     if window.home.resolve() == Path.home().resolve() or {r.session_id for r in window.records} != {"claude-session", "codex-session", "harness-session"}:
         raise ValueError("Synthetic import qualification refuses real or unknown source data")
     target = window.state.root / "synthetic-import-target"
-    if not (target / "示例项目").is_dir():
-        raise ValueError("Synthetic target must be prepared by the acceptance fixture generator")
+    target_project = target / "示例项目"
+    projects = discover_projects(window.records, window.home)
+    if (not target_project.is_dir() or len(projects) != 1
+            or not (window.home / "示例项目/selected.txt").is_file()):
+        raise ValueError("Synthetic source and target must be prepared by the acceptance fixture generator")
     before_source = {str(p): hash_file(p) for p in window.home.rglob("*") if p.is_file()}
     key = window.state.root / "synthetic-recovery.asmkey"
     save_recovery_key(key)
-    exported = make_backup(window.library, window.records, window.state.root / "synthetic-export", key)
-    package = PackageLibrary(Path(exported["portable"]), window.state.cache)
+
+    draft = "先核对消息 #1，再检查设置页的三个分组。"
+
+    def fixture_model(prompt, check):
+        check()
+        if "把设置页分成账号" not in prompt or "fixture-existing-thinking" in prompt:
+            raise ValueError("Unexpected synthetic model input")
+        return draft
+
+    project_id = projects[0].id
+    exported = make_backup(window.library, window.records, window.state.root / "synthetic-export", key,
+                           project_choices={project_id: ("files", False)}, model=fixture_model)
+    package = PackageLibrary(Path(exported["portable"]), window.state.cache / "synthetic-receiving")
     selected = package.scan().records
+    mapped = [(r.cwd, mapped_project(r, {project_id: str(target_project)})) for r in selected]
+    view = ProjectView(package, project_id)
+    project_entries = [package.entries[name] for name in view.items]
+    providers = {r.provider for r in selected}
+    owners = {r.uid for r in selected}
+    project_shared = (providers == {"claude", "codex", "deepseek"}
+                      and len(package.package_catalog.get("projects", [])) == 1
+                      and sorted(e["projectPath"] for e in project_entries) == ["existing.txt", "selected.txt"]
+                      and all(set(e["sessionUids"]) == owners for e in project_entries)
+                      and all(path == str(target_project) for _, path in mapped))
+
+    reading = materialize_readings(package)
+    prompts, fingerprints = load_prompts(extra=reading["extraPromptsPath"])
+    catalog = ReadingCatalog(reading["readingRoot"], prompts, fingerprints).scan()
+    main = next(r for r in catalog.entries if r.kind == "main")
+    messages, digest = catalog.read(main)
+    reading_meta = package.package_catalog["readings"][next(r.uid for r in selected if r.provider == "claude")]
+    claude_readback = (len(messages) == 2 and "把设置页分成账号" in messages[0].numbered_body()
+                       and messages[0].start < messages[1].start and digest == reading_meta["sourceSha256"]
+                       and draft in prompts[main.number].prompt and exported["handoff"] == {"generated": 1})
+
+    existing = target_project / "existing.txt"
+    with existing.open("xb") as stream:
+        stream.write(b"synthetic target version")
+    before_project = inventory(target_project)
+    project_plan = build_file_plan(view, list(view.items), (), target_project, window.state.root / "synthetic-project-backups")
+    project_report = execute_file_restore(view, project_plan)
+    project_recovered = (project_plan["new"] == 1 and project_plan["skip"] == 1 and project_plan["blocked"] == 0
+                         and project_report["backupVerified"] and project_report["readbackVerified"]
+                         and (target_project / "selected.txt").read_bytes() == b"synthetic work file"
+                         and existing.read_bytes() == b"synthetic target version")
+
     targets = {p: str(target / d) for p, d in [("claude", ".claude"), ("codex", ".codex"), ("deepseek", ".dsh")]}
     before = {p: inventory(Path(root)) for p, root in targets.items()}
-    plan = build_plan(package, selected, targets, {r.cwd: str(target / "示例项目") for r in selected}, window.state.cache)
-    if len(plan.ready) != 3:
-        raise ValueError("Synthetic import preview did not admit all three providers")
+    try:
+        build_plan(package, selected, targets, dict(mapped), window.state.cache)
+    except ValueError as error:
+        if str(error) != CLAUDE_READ_ONLY:
+            raise
+    else:
+        raise ValueError("Synthetic import preview admitted Claude as a native provider")
+    native = [r for r in selected if r.provider in NATIVE_PROVIDERS]
+    plan = build_plan(package, native, targets, dict(mapped), window.state.cache)
+    if {item["record"]["provider"] for item in plan.ready} != {"codex", "deepseek"}:
+        raise ValueError("Synthetic import preview did not admit Codex and DeepSeek Harness")
     report = execute_import(plan, window.state.root / "synthetic-target-backups", window.state.cache, confirmed_offline=True)
-    duplicate = build_plan(package, selected, targets, {r.cwd: str(target / "示例项目") for r in selected}, window.state.cache)
+    claude_untouched = before["claude"] == inventory(Path(targets["claude"]))
+    duplicate = build_plan(package, native, targets, dict(mapped), window.state.cache)
+    skipped = {item["record"]["provider"] for item in duplicate.items if item["action"] == "skip"}
     restored = rollback_import(Path(report["journal"]), window.state.cache, confirmed_offline=True)
+    project_rollback = rollback_file_restore(project_report)
     source_unchanged = before_source == {str(p): hash_file(p) for p in window.home.rglob("*") if p.is_file()}
     target_restored = before == {p: inventory(Path(root)) for p, root in targets.items()}
-    result = {"syntheticOnly": True, "providers": sorted(targets), "imported": report["imported"], "backupVerified": report["backupVerified"], "nativeReadback": report["nativeReadback"], "duplicateIdsSkipped": len(duplicate.ready) == 0, "rollbackVerified": restored["rollbackVerified"] and target_restored, "sourceFilesUnchanged": source_unchanged}
-    result["ok"] = report["status"] == "complete" and all(result[k] for k in ["backupVerified", "duplicateIdsSkipped", "rollbackVerified", "sourceFilesUnchanged"])
+    result = {
+        "syntheticOnly": True, "providers": sorted(providers), "imported": report["imported"],
+        "backupVerified": report["backupVerified"], "nativeReadback": report["nativeReadback"],
+        "duplicateIdsSkipped": not duplicate.ready and skipped == {"codex", "deepseek"},
+        "rollbackVerified": restored["rollbackVerified"] and target_restored,
+        "sourceFilesUnchanged": source_unchanged, "projectArchivedOnce": project_shared,
+        "projectConflictAndRecoveryVerified": project_recovered,
+        "projectRollbackVerified": project_rollback["rollbackVerified"] and inventory(target_project) == before_project,
+        "claudeReadingAndDraftVerified": claude_readback, "claudeNativeStoreUntouched": claude_untouched,
+        "privateBackupVerified": exported["encryptedReadbackVerified"], "portablePrivacyVerified": exported["privacyCheck"]["verified"],
+    }
+    result["mixedPackageVerified"] = all(result[k] for k in [
+        "projectArchivedOnce", "projectConflictAndRecoveryVerified", "projectRollbackVerified",
+        "claudeReadingAndDraftVerified", "claudeNativeStoreUntouched", "privateBackupVerified", "portablePrivacyVerified",
+    ])
+    result["ok"] = report["status"] == "complete" and report["imported"] == 2 and all(result[k] for k in [
+        "backupVerified", "duplicateIdsSkipped", "rollbackVerified", "sourceFilesUnchanged", "mixedPackageVerified",
+    ])
     return result
 
 
@@ -104,11 +184,15 @@ def main():
     parser.add_argument("--smoke-real", action="store_true")
     parser.add_argument("--smoke-import", action="store_true")
     parser.add_argument("--smoke-recovery", action="store_true")
+    parser.add_argument("--smoke-history", action="store_true")
+    parser.add_argument("--smoke-history-session")
     args, _ = parser.parse_known_args()
-    if any([args.smoke_home, args.smoke_state, args.smoke_report, args.smoke_screenshot, args.smoke_real, args.smoke_import, args.smoke_recovery]) and os.environ.get("ASM_ACCEPTANCE_TEST") != "1":
+    if any([args.smoke_home, args.smoke_state, args.smoke_report, args.smoke_screenshot, args.smoke_real, args.smoke_import, args.smoke_recovery, args.smoke_history, args.smoke_history_session]) and os.environ.get("ASM_ACCEPTANCE_TEST") != "1":
         raise SystemExit("Internal acceptance hooks are disabled for normal application launches")
     if (args.smoke_import or args.smoke_recovery) and (not args.smoke_report or not args.smoke_state or not args.smoke_home or args.smoke_real or Path(args.smoke_home).resolve() == Path.home().resolve()):
         raise SystemExit("Import acceptance requires isolated synthetic homes and a report")
+    if args.smoke_history and (not args.smoke_report or not args.smoke_state or not args.smoke_real or args.smoke_import or args.smoke_recovery):
+        raise SystemExit("History acceptance requires explicit read-only real data, isolated state and report")
     if args.smoke_report:
         roots = []
         for home in {Path.home().resolve(), Path(args.smoke_home or Path.home()).resolve()}:
@@ -147,6 +231,10 @@ def main():
         available = screen.availableGeometry()
         window.resize(min(1440, available.width() - 40), min(940, available.height() - 60))
     window.show()
+    if args.smoke_history:
+        from .history_smoke import start_history_smoke
+        start_history_smoke(window, app, args)
+        return app.exec()
     if args.smoke_screenshot and not args.smoke_real:
         window.resize(1440, 940)
     if args.smoke_report:

@@ -289,7 +289,8 @@ class RecoveryCenter(QWidget):
         self.next.setEnabled(idle and self.offset + self.PAGE_SIZE < self.total)
         self.preview_button.setEnabled(idle and bool(self.catalog) and self.source_matches() and bool(self.selected_items or self.selected_groups))
         self.ack.setEnabled(idle and bool(self.plan))
-        self.restore_button.setEnabled(idle and bool(self.plan) and self.ack.isChecked() and bool(self.plan.get("new")))
+        self.restore_button.setEnabled(idle and bool(self.plan) and self.ack.isChecked() and bool(self.plan.get("new"))
+                                       and self.plan.get("space", {}).get("enough", True))
         self.plan_previous.setEnabled(idle and bool(self.plan) and self.plan_offset > 0)
         self.plan_next.setEnabled(idle and bool(self.plan) and self.plan_offset + self.PAGE_SIZE < int((self.plan or {}).get("selected", 0)))
         for widget in (self.check_record_button, self.open_record_button, self.rollback_button):
@@ -507,9 +508,13 @@ class RecoveryCenter(QWidget):
                         raise ValueError(f"{group.get('label', '')}：{STATUSES.get(group.get('status'), group.get('status'))}；{group.get('detail', '')}")
             return build_file_plan(self.catalog, items, groups, target, backup, progress=progress, cancel=self.cancel)
         def done(plan):
+            from .gui import file_restore_space_text
             self.plan = plan; self.plan_offset = 0; self.ack.setChecked(False)
             self.groups = self.catalog.groups(); self.fill_groups()
-            self.summary.setText(f"目标：{plan['target']}\n目标备份：{plan['backupRoot']}\n新增 {plan['new']} · 跳过 {plan['skip']} · 阻止 {plan['blocked']} · {size_text(plan.get('bytes'))}\n已有文件不覆盖；阻止项不会写入。Mac 应用资料仅导出副本。")
+            space_text = file_restore_space_text(plan.get('space'))
+            self.summary.setText(f"目标：{plan['target']}\n目标备份：{plan['backupRoot']}\n新增 {plan['new']} · 跳过 {plan['skip']} · 阻止 {plan['blocked']} · {size_text(plan.get('bytes'))}\n"
+                                 + (space_text + "\n" if space_text else "")
+                                 + "同名文件将保留目标版本。Mac 应用资料按文件副本提取。")
             self.tabs.setCurrentIndex(1); self.load_plan_page()
         self.run_task(work, done, "正在生成冲突与路径安全预览")
 
@@ -535,6 +540,9 @@ class RecoveryCenter(QWidget):
             return
         if not self.plan or not self.ack.isChecked() or not self.plan.get("new"):
             self.show_error("请先生成预览并确认明文目标备份的隐私提示。")
+            return
+        if not self.plan.get("space", {}).get("enough", True):
+            self.show_error("空间不足，请更改位置后重新预览。")
             return
         from .file_restore import execute_file_restore
         plan = self.plan

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict, deque
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -10,10 +11,11 @@ import shutil
 import threading
 import zipfile
 
-from .adapters import LocalLibrary, claude_messages, codex_messages, dsh_messages
+from .adapters import LocalLibrary, claude_messages, codex_messages, dsh_messages, timestamp
 from .backup import SCHEMA
+from .portable import PORTABLE_SCHEMA
 from .models import Attachment, Catalog, SessionPage, SessionRecord, identity
-from .safeio import CHUNK, ReadFailure, SnapshotStore, open_lines, read_json, independent_copy, hash_file
+from .safeio import CHUNK, ReadFailure, file_signature, header, open_lines, independent_copy, hash_file
 
 
 class PackageLibrary(LocalLibrary):
@@ -37,7 +39,7 @@ class PackageLibrary(LocalLibrary):
                 raise ValueError("数据包存在重复对象")
             if any(PurePosixPath(x).is_absolute() or ".." in PurePosixPath(x).parts or "\\" in x or ":" in x for x in self.names):
                 raise ValueError("数据包路径不安全")
-            if self.manifest.get("schema") == SCHEMA:
+            if self.manifest.get("schema") in {SCHEMA, PORTABLE_SCHEMA}:
                 if z.getinfo("catalog.json").file_size > 64 * CHUNK:
                     raise ValueError("会话目录过大")
                 raw = z.read("catalog.json")
@@ -51,7 +53,9 @@ class PackageLibrary(LocalLibrary):
             else:
                 raise ValueError("尚未支持的数据包格式，原文件未改变")
         self.legacy_adapters = {}
-        self._legacy_original = {}
+        self._legacy_histories = {}
+        self._legacy_history_files = {}
+        self._legacy_logs = {}
         self._origins = {}
 
     def _extract(self, object_name: str, filename="payload") -> Path:
@@ -98,10 +102,12 @@ class PackageLibrary(LocalLibrary):
             return self.catalog
         records, sources, warnings = [], [], []
         self.by_root_path = {(e["root"], e["path"]): e for e in self.manifest["entries"] if "object" in e}
+        if len(self.by_root_path) != len(self.entries):
+            raise ValueError("旧数据包存在重复的来源文件路径")
         for root in self.manifest.get("roots", []):
             kind, label = root["kind"], root["label"]
             if kind == "codex":
-                state = [e for (r, p), e in self.by_root_path.items() if r == label and re.fullmatch(r"state_\d+\.sqlite", p)]
+                state = self.legacy_databases(label, "state")
                 if not state:
                     continue
                 progress("读取旧迁移包的会话目录", 0)
@@ -111,38 +117,121 @@ class PackageLibrary(LocalLibrary):
                 canonical = cached_root / Path(state[-1]["path"]).name
                 if not canonical.exists():
                     independent_copy(state_file, canonical)
+                elif canonical.is_symlink() or canonical.is_junction() or hash_file(canonical) != state[-1]["sha256"]:
+                    raise ValueError("旧包数据库缓存已变化，请更改缓存位置后重新打开")
                 adapter = LocalLibrary(Path.home(), self.cache / "db-cache", check_project_paths=False)
-                subset = adapter._scan_codex(cached_root)
+                subset = adapter._scan_codex(cached_root, db_root_override=cached_root)
+                history = self.legacy_databases(label, "thread_history")
+                if history:
+                    self._legacy_histories[label] = history[-1]
+                self._legacy_logs[label] = [e for (r, p), e in self.by_root_path.items() if r == label
+                                            and self.legacy_log_path(p, {"sessions", "archived_sessions"})]
                 for record in subset:
                     record.uid = identity("codex", str(self.archive) + label, record.session_id)
                     record.metadata.update(package=str(self.archive), package_root_label=label, preview_only=True)
                     self.legacy_adapters[record.uid] = adapter
-                    self._legacy_original[record.uid] = record
                 records.extend(subset)
                 sources.append({"provider": "codex", "path": str(self.archive), "status": "旧迁移包预览", "count": len([r for r in subset if not r.child])})
             elif kind == "claude-code":
-                try:
-                    with zipfile.ZipFile(self.archive) as z:
-                        index = json.loads(z.read("session-catalog.json")).get("claudeDesktop", [])
-                except KeyError:
-                    index = []
-                by_id = {}
-                for data in index:
-                    sid = data.get("cliSessionId")
-                    if not sid:
-                        continue
-                    matched = [e for (r, p), e in self.by_root_path.items() if r == label and p.endswith("/" + sid + ".jsonl")]
-                    if not matched:
-                        continue
-                    from .adapters import timestamp
-                    record = SessionRecord(identity("claude", str(self.archive) + label, sid), "claude", sid, data.get("title") or "未命名会话 · " + sid[:12], str(self.archive), data.get("cwd", ""), timestamp(data.get("lastActivityAt")), bool(data.get("isArchived")), files=[], metadata={"package": str(self.archive), "preview_only": True, "legacy_objects": [e["object"] for e in matched]})
-                    if sid not in by_id or record.updated > by_id[sid].updated:
-                        by_id[sid] = record
-                records.extend(by_id.values())
-                sources.append({"provider": "claude", "path": str(self.archive), "status": "旧迁移包预览", "count": len(by_id)})
+                subset = self.legacy_claude_records(label)
+                records.extend(subset)
+                sources.append({"provider": "claude", "path": str(self.archive), "status": "旧迁移包预览", "count": sum(not r.child for r in subset)})
         warnings.append("旧数据包按索引预览；按需解压所选历史到本工具缓存，不写入任何原客户端。")
         self.catalog = Catalog(sorted(records, key=lambda r: r.updated, reverse=True), sources, warnings)
         return self.catalog
+
+    def legacy_databases(self, label, prefix):
+        pattern = re.compile(re.escape(prefix) + r"_(\d+)\.sqlite")
+        found = [(int(match[1]), entry) for (root, path), entry in self.by_root_path.items()
+                 if root == label and (match := pattern.fullmatch(path))]
+        return [entry for _, entry in sorted(found, key=lambda pair: pair[0])]
+
+    @staticmethod
+    def legacy_log_path(value, folders):
+        path = PurePosixPath(value)
+        return (len(path.parts) >= 2 and path.parts[0] in folders and path.as_posix() == value
+                and not any(part == ".." or ":" in part or "\\" in part for part in path.parts)
+                and path.name.endswith((".jsonl", ".jsonl.zst", ".jsonl.zstd")))
+
+    def legacy_claude_records(self, label):
+        with zipfile.ZipFile(self.archive) as z:
+            if "session-catalog.json" in self.names:
+                if z.getinfo("session-catalog.json").file_size > 64 * CHUNK:
+                    raise ValueError("旧包会话索引过大")
+                index = json.loads(z.read("session-catalog.json")).get("claudeDesktop", [])
+            else:
+                index = []
+        by_id = {}
+        for item in index:
+            sid = item.get("cliSessionId")
+            updated = timestamp(item.get("lastActivityAt"))
+            if sid and (sid not in by_id or timestamp(by_id[sid].get("lastActivityAt")) < updated):
+                by_id[sid] = item
+        logs = defaultdict(list)
+        for (root, path), entry in self.by_root_path.items():
+            if root != label or not self.legacy_log_path(path, {"projects"}):
+                continue
+            parts = PurePosixPath(path).parts
+            child = len(parts) == 5 and parts[3] == "subagents"
+            if len(parts) != 3 and not child:
+                continue
+            sid = re.sub(r"\.jsonl(?:\.zst[d]?)?$", "", parts[-1])
+            logs[sid, parts[2] if child else ""].append(entry)
+        location = self.cache / label
+        for (sid, parent), entries in logs.items():
+            data = {} if parent else by_id.get(sid, {})
+            yield SessionRecord(
+                identity("claude", str(self.archive) + label, sid + (":" + parent if parent else "")),
+                "claude", sid, data.get("title") or ("子代理 · " if parent else "未命名会话 · ") + sid[:12],
+                str(location), data.get("cwd", ""), timestamp(data.get("lastActivityAt")),
+                bool(data.get("isArchived")), child=bool(parent), files=[str(location / e["path"]) for e in entries],
+                metadata={"package": str(self.archive), "preview_only": True, "legacy_objects": [e["object"] for e in entries]},
+            )
+
+    def legacy_rollout(self, record):
+        label = record.metadata["package_root_label"]
+        declared = str(record.metadata.get("native_thread_metadata", {}).get("rollout_path") or "").replace("\\", "/")
+        matches, preferred = [], []
+        for entry in self._legacy_logs.get(label, []):
+            relative = entry["path"]
+            exact = any(declared == path or declared.endswith("/" + path)
+                        for path in (relative, relative.removesuffix(".zst").removesuffix(".zstd")))
+            basename = PurePosixPath(relative).name
+            possible = any(basename.endswith(suffix) for suffix in (record.session_id + ".jsonl", record.session_id + ".jsonl.zst",
+                                                                    record.session_id + ".jsonl.zstd"))
+            if not (exact or possible):
+                continue
+            local = self._extract(entry["object"], relative)
+            start = header(local)
+            if start.get("type") == "session_meta" and start.get("payload", {}).get("id") == record.session_id:
+                (preferred if exact else matches).append((local, relative))
+        chosen = preferred or matches
+        if len(chosen) > 1:
+            raise ValueError("旧包中该 Codex 会话存在多份不同来源的 rollout，请先核对原包")
+        return chosen[0] if chosen else None
+
+    def legacy_codex_record(self, record):
+        label = record.metadata["package_root_label"]
+        history = self._legacy_histories.get(label)
+        path = None
+        if history:
+            with self._extract_lock:
+                ready, signature = self._legacy_history_files.get(label, (None, None))
+                if ready is not None and ready.is_file() and not ready.is_symlink() and file_signature(ready) == signature:
+                    path = ready
+                else:
+                    path = self._extract(history["object"], history["path"])
+                    self._legacy_history_files[label] = (path, file_signature(path))
+        metadata = dict(record.metadata, preview_only=False, history_database=str(path) if path else "")
+        return replace(record, metadata=metadata, files=[])
+
+    def native_database_rows(self, record):
+        if self.package_catalog is None and record.uid in self.legacy_adapters:
+            yield from self.legacy_adapters[record.uid].native_database_rows(self.legacy_codex_record(record))
+
+    def _event_attachments(self, record, event, output, include_embedded=True):
+        # Package exports can copy declared attachment objects, never paths on the current computer.
+        return None
 
     def raw_events(self, record):
         if self.package_catalog is not None:
@@ -152,17 +241,17 @@ class PackageLibrary(LocalLibrary):
         elif record.provider == "claude":
             names = record.metadata.get("legacy_objects", [])
             if names:
-                yield from open_lines(self._extract(names[0], "history.jsonl"))
+                yield from open_lines(self._extract(names[0], self.entries[names[0]]["path"]))
         elif record.provider == "codex":
-            label = record.metadata["package_root_label"]
-            found = [e for (r, p), e in self.by_root_path.items() if r == label and re.fullmatch(r"thread_history_\d+\.sqlite", p)]
-            if found:
-                database = self._extract(found[-1]["object"], found[-1]["path"])
-                root = Path(record.root)
-                canonical = root / Path(found[-1]["path"]).name
-                if not canonical.exists():
-                    independent_copy(database, canonical)
-                yield from self.legacy_adapters[record.uid].raw_events(record)
+            local = self.legacy_codex_record(record)
+            found = False
+            for event in self.legacy_adapters[record.uid].raw_events(local):
+                found = True
+                yield event
+            if not found and (rollout := self.legacy_rollout(record)):
+                for event in open_lines(rollout[0]):
+                    if event.get("type") == "response_item":
+                        yield {"item": event.get("payload", {}), "_original_event": event}
 
     def page(self, record, limit=100, cancel=None):
         result = SessionPage()
@@ -193,16 +282,21 @@ class PackageLibrary(LocalLibrary):
         if self.package_catalog is not None:
             for name, entry in self.entries.items():
                 if (entry.get("sessionUid") == record.uid or record.uid in entry.get("sessionUids", [])) and entry.get("role") != "lossless-history-export":
-                    if entry.get("role") == "project-work-file" and not getattr(self, "_include_packaged_projects", False):
+                    if entry.get("role") in {"project-work-file", "project-local-change"} and not getattr(self, "_include_packaged_projects", False):
                         continue
                     cached = self._extract(name, Path(entry.get("originalPath") or entry.get("logicalName") or "payload").name)
-                    self._origins[str(cached)] = {"originalPath": entry.get("originalPath") or entry.get("logicalName") or "derived-record", **{k: entry[k] for k in ["logicalName", "displayName", "mediaType"] if k in entry}}
+                    self._origins[str(cached)] = {"originalPath": entry.get("originalPath") or entry.get("logicalName") or "derived-record", **{k: entry[k] for k in ["logicalName", "displayName", "mediaType", "projectId", "projectPath", "readingNumber", "sourceSha256"] if k in entry}}
                     yield cached, entry.get("role", "original-session")
         elif record.provider == "claude":
             for name in record.metadata.get("legacy_objects", []):
-                cached = self._extract(name, "history.jsonl")
-                self._origins[str(cached)] = {"originalPath": self.entries[name].get("path", "history.jsonl")}
+                relative = self.entries[name]["path"]
+                cached = self._extract(name, relative)
+                self._origins[str(cached)] = {"originalPath": str(Path(record.root) / relative)}
                 yield cached, "original-session"
+        elif record.provider == "codex" and (rollout := self.legacy_rollout(record)):
+            cached, relative = rollout
+            self._origins[str(cached)] = {"originalPath": str(Path(record.root) / relative)}
+            yield cached, "original-session"
 
     def origin_metadata(self, path):
         return self._origins.get(str(path), {"originalPath": str(path)})
