@@ -4,11 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-session-migration"
-version = "0.3.0"
+version = "0.4.3"
 description = "Local desktop session viewer and backup tool for Claude, Codex and DeepSeek Harness"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = ["PySide6-Essentials==6.12.0", "zstandard==0.25.0", "cryptography==50.0.2"]
+
+[project.scripts]
+ai-session-migration-windows-restore = "ai_session_migration.windows_restore.guide:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

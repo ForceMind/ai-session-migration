@@ -5,7 +5,8 @@ target directories remain available for conditional rollback, including after a 
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing, contextmanager
 import csv
 import ctypes
 from dataclasses import dataclass, field
@@ -31,12 +32,21 @@ from .backup import check_cancel as _check_cancel, verify_package
 from .models import SessionRecord
 from .packages import PackageLibrary
 from .safeio import (CHUNK, MAX_LINE, SnapshotStore, atomic_json, hash_file,
-                     independent_copy, open_lines, remote_path, stable_bytes, within)
+                     header, independent_copy, open_lines, remote_path, stable_bytes, within)
 
 SCHEMA = "asm-native-import-1"
-PROVIDERS = {"claude", "codex", "deepseek"}
+from .migration_policy import forbid_claude_directory, forbid_client_storage, require_native_targets
+from .attachments import ATTACHMENT_KINDS, ATTACHMENT_PATH_FIELDS, local_file_uri_path
+from .portable import PORTABLE_SCHEMA, check_portable
 HISTORY_TABLES = {"thread_turns", "thread_items", "thread_history_projection_state", "thread_realtime_items"}
 STATE_TABLES = {"threads", "projects", "project_roots", "thread_attachments", "thread_spawn_edges"}
+CODEX_CREATOR_FIELDS = ("creator_user_id", "creator_account_id")
+CODEX_ROLLOUT_OFFSETS = ("rollout_byte_offset", "rollout_end_byte_offset", "next_rollout_byte_offset")
+CLAUDE_ACCOUNT_FIELDS = ("accountUuid", "ownerAccountUuid", "ownerOrganizationUuid", "vetoedAgainstAccountUuid")
+CODEX_SESSION_DIRS = {"sessions", "archived_sessions", "attachments"}
+CODEX_INDEX = re.compile(r"(?:state|thread_history)_\d+\.sqlite(?:-wal|-shm|-journal)?", re.IGNORECASE)
+DSH_V4_LOG = re.compile(r"session\.v4\.jsonl(?:\.zstd)?")
+WINDOWS_CLIENT_HOMES = {"codex": ".codex", "claude": ".claude", "deepseek": ".dsh"}
 
 
 def check_cancel(cancel):
@@ -59,13 +69,45 @@ def checked_directory(value: Path) -> Path:
     return value
 
 
-def inventory(root: Path, progress=lambda *_: None, cancel=None) -> dict:
-    """Hash every regular file; refuse incomplete backups, links and special files."""
+def claude_project_origin(cwd, source, mappings):
+    """Translate the original project separately from a session's working directory."""
+    cwd = Path(cwd)
+    original, working = source.get("originCwd"), source.get("cwd")
+    if not isinstance(original, str) or not isinstance(working, str) or not original or original == working:
+        return cwd
+    candidate = mappings.get(original)
+    if candidate is None:
+        foreign = PureWindowsPath if PureWindowsPath(working).is_absolute() else PurePosixPath
+        origin, old_cwd = foreign(original), foreign(working)
+        if not origin.is_absolute() or ".." in origin.parts or ".." in old_cwd.parts or not old_cwd.is_relative_to(origin):
+            return cwd
+        suffix = old_cwd.relative_to(origin).parts
+        if not suffix or len(cwd.parts) <= len(suffix):
+            return cwd
+        if tuple(p.casefold() for p in cwd.parts[-len(suffix):]) != tuple(p.casefold() for p in suffix):
+            return cwd
+        candidate = cwd.parents[len(suffix) - 1]
+    try:
+        directory = checked_directory(Path(candidate))
+    except (OSError, ValueError):
+        return cwd
+    return directory if directory.is_dir() else cwd
+
+
+def inventory(root: Path, progress=lambda *_: None, cancel=None, *, codex_sessions=False) -> dict:
+    """Hash the planned files, refusing links, special files, and incomplete scans."""
     if not root.exists():
         return {"exists": False, "files": {}}
     checked_directory(root)
-    result = {}
-    for base, dirs, files in os.walk(root, followlinks=False):
+    result, regular = {}, []
+
+    def fail_scan(error):
+        raise error
+
+    for base, dirs, files in os.walk(root, followlinks=False, onerror=fail_scan):
+        if codex_sessions and Path(base) == root:
+            dirs[:] = [name for name in dirs if name.casefold() in CODEX_SESSION_DIRS]
+            files = [name for name in files if CODEX_INDEX.fullmatch(name)]
         for name in sorted(dirs + files):
             check_cancel(cancel)
             p = Path(base) / name
@@ -74,30 +116,74 @@ def inventory(root: Path, progress=lambda *_: None, cancel=None) -> dict:
                 raise ValueError("目标含链接或特殊文件，无法作完整安全备份：" + str(p))
             relative = p.relative_to(root).as_posix()
             if stat.S_ISREG(st.st_mode):
-                digest = hash_file(p)
-                after = p.stat()
-                if (st.st_size, st.st_mtime_ns, st.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
-                    raise ValueError("目标资料仍在变化，请退出客户端后重新预览")
-                result[relative] = {"sha256": digest, "bytes": st.st_size, "mode": stat.S_IMODE(st.st_mode)}
+                regular.append((relative, p, st))
             else:
                 result[relative + "/"] = {"directory": True, "mode": stat.S_IMODE(st.st_mode)}
-        progress("检查目标资料 " + root.name, 0)
-    return {"exists": True, "files": result}
+
+    def check_file(relative, path, before):
+        check_cancel(cancel)
+        digest = hash_file(path)
+        after = path.lstat()
+        before_signature = before.st_size, before.st_mtime_ns, before.st_ino, before.st_mode
+        after_signature = after.st_size, after.st_mtime_ns, after.st_ino, after.st_mode
+        if before_signature != after_signature:
+            raise ValueError("目标资料仍在变化，请退出客户端后重新预览")
+        return relative, {"sha256": digest, "bytes": before.st_size, "mode": stat.S_IMODE(before.st_mode)}
+
+    label = ".codex 会话" if codex_sessions else re.sub(r"^\.asm-stage-[a-f0-9]{32}-", "暂存 ", root.name)
+    step = f"检查 {label}（{len(regular)} 个文件）"
+    if regular:
+        progress(step, 0)
+        percent = 0
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="target-check") as pool:
+            futures = [pool.submit(check_file, *item) for item in regular]
+            try:
+                for count, future in enumerate(as_completed(futures), 1):
+                    name, info = future.result()
+                    result[name] = info
+                    updated = 100 * count // len(futures)
+                    if updated != percent:
+                        percent = updated
+                        progress(step, percent)
+            finally:
+                for future in futures:
+                    future.cancel()
+    else:
+        progress(step, 100)
+    return {"exists": True, "files": dict(sorted(result.items()))}
 
 
 def native_processes(targets: dict[str, str]) -> list[str]:
     """Refuse known live native clients for normal client homes; never terminate them."""
-    defaults = {Path.home() / ".claude", Path.home() / ".codex", Path.home() / ".dsh"}
-    defaults.update(Path(os.environ[v]).expanduser() for v in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "DSH_HOME"] if os.environ.get(v))
-    if not any(Path(p).resolve() in {d.resolve() for d in defaults} for p in targets.values()):
+    home = Path.home()
+    clients = {
+        "claude": (".claude", "CLAUDE_CONFIG_DIR", {"claude.exe", "claude-desktop.exe"}),
+        "codex": (".codex", "CODEX_HOME", {"codex.exe", "chatgpt.exe", "codex-code-mode-host.exe"}),
+        "deepseek": (".dsh", "DSH_HOME", {"deepseek harness.exe", "dsh.exe", "deepseek.exe"}),
+    }
+    expected = set()
+    for provider, (folder, variable, processes) in clients.items():
+        defaults = {home / folder, Path(os.environ.get(variable) or home / folder).expanduser().resolve()}
+        if provider in targets and Path(targets[provider]).resolve() in defaults:
+            expected.update(processes)
+    if "claude_desktop" in targets:
+        desktop_root = home / "AppData" / "Local" / "Claude-Data"
+        if within(Path(targets["claude_desktop"]), desktop_root):
+            expected.update(clients["claude"][2])
+    if not expected:
         return []
     try:
         if sys.platform == "win32":
-            out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, check=True, timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-            names = [r[0].lower() for r in csv.reader(io.StringIO(out)) if r]
-            return sorted({n for n in names if n in {"claude.exe", "codex.exe", "dsh.exe", "deepseek.exe"}})
+            result = subprocess.run(["tasklist.exe", "/FO", "CSV", "/NH"], capture_output=True, check=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
+            # Only the ASCII executable names and numeric PIDs matter in the localized CSV.
+            rows = list(csv.reader(io.StringIO(result.stdout.decode("mbcs", errors="replace"))))
+            names = {row[0].casefold() for row in rows if len(row) >= 2 and row[1].isdigit()}
+            if not names:
+                raise ValueError("Windows 未返回可核验的进程表")
+            return sorted(names & expected)
         out = subprocess.run(["ps", "-ax", "-o", "comm="], capture_output=True, text=True, check=True, timeout=15).stdout
-        return sorted({Path(line.strip()).name for line in out.splitlines() if Path(line.strip()).name.lower() in {"claude", "codex", "dsh", "deepseek"}})
+        active = {Path(line.strip()).name.lower() for line in out.splitlines()}
+        return sorted(active & {n.removesuffix(".exe") for n in expected})
     except (OSError, subprocess.SubprocessError) as error:
         raise ValueError("无法检查原客户端是否已退出，未开始写入：" + type(error).__name__) from error
 
@@ -136,6 +222,25 @@ def dsh_project_key(cwd: str) -> str:
     return "--" + (result.lstrip("-") or "root")[:251] + "--"
 
 
+def legacy_windows_paths():
+    if sys.platform != "win32":
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\FileSystem") as key:
+            return winreg.QueryValueEx(key, "LongPathsEnabled")[0] != 1
+    except OSError:
+        return True
+
+
+def stage_directory(root: Path, transaction: str) -> Path:
+    return root.with_name(".asm-stage-" + transaction + "-" + root.name)
+
+
+def dsh_log_destination(root: Path, cwd: str, sid: str, filename: str) -> Path:
+    return root / "sessions" / dsh_project_key(cwd) / sid / filename
+
+
 def entries_for(package: PackageLibrary, record: SessionRecord):
     return [e for e in package.entries.values() if e.get("sessionUid") == record.uid or record.uid in e.get("sessionUids", [])]
 
@@ -161,6 +266,59 @@ def source_logs(package, record):
             rel = relative_original(e.get("originalPath", ""), record.root)
             result.append((e, rel))
     return result
+
+
+def codex_rollout(package, record, rows, cancel):
+    required = {
+        entry["row"][key] for entry in rows if entry.get("table") in HISTORY_TABLES
+        for key in CODEX_ROLLOUT_OFFSETS if entry["row"].get(key) is not None
+    } - {0}
+    candidates = [
+        (entry, rel) for entry, rel in source_logs(package, record)
+        if rel.name.endswith((".jsonl", ".jsonl.zst", ".jsonl.zstd"))
+    ]
+    if not candidates:
+        if required:
+            raise ValueError("Codex 分页索引引用了原始 rollout，但包内没有该日志")
+        if record.metadata.get("history_mode") != "paginated":
+            raise ValueError("Codex 旧式历史缺少原始 rollout，不能伪造可续聊记录")
+        return None
+    native_path = next(
+        entry["row"].get("rollout_path") for entry in rows if entry.get("table") == "threads"
+        and entry["row"].get("id") == record.session_id
+    )
+    candidates.sort(key=lambda pair: pair[0]["originalPath"] != native_path)
+    correct_header = False
+    for entry, rel in candidates:
+        check_cancel(cancel)
+        path = package._extract(entry["object"], rel.name)
+        with path.open("rb") as raw:
+            reader = zstandard.ZstdDecompressor().stream_reader(raw, read_across_frames=True) if path.suffix in {".zst", ".zstd"} else raw
+            with io.BufferedReader(reader) as stream:
+                first = stream.readline(MAX_LINE + 1)
+                if len(first) > MAX_LINE or not first.endswith(b"\n"):
+                    continue
+                meta = json.loads(first)
+                if meta.get("type") != "session_meta" or meta.get("payload", {}).get("id") != record.session_id:
+                    continue
+                correct_header = True
+                if not required:
+                    return entry["object"]
+                offset = len(first)
+                pending = required - {offset}
+                last_offset = max(required)
+                while pending and offset < last_offset:
+                    check_cancel(cancel)
+                    line = stream.readline(MAX_LINE + 1)
+                    if len(line) > MAX_LINE or not line.endswith(b"\n"):
+                        break
+                    offset += len(line)
+                    pending.discard(offset)
+                if not pending:
+                    return entry["object"]
+    if correct_header:
+        raise ValueError("Codex 分页偏移不对应完整日志边界，需重新导出稳定资料")
+    raise ValueError("Codex 日志首条记录与会话 ID 不一致")
 
 
 def codex_databases(root: Path, expected_root=None):
@@ -191,6 +349,7 @@ class ImportPlan:
     items: list[dict]
     mappings: dict
     warnings: list[str] = field(default_factory=list)
+    codex_sessions: bool = False
 
     @property
     def ready(self):
@@ -201,35 +360,35 @@ class ImportPlan:
         return asdict(self)
 
 
-def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: dict, mappings: dict, cache: Path, progress=lambda *_: None, cancel=None) -> ImportPlan:
+def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: dict, mappings: dict, cache: Path, progress=lambda *_: None, cancel=None, *, codex_sessions=False, expected_project_dirs=()) -> ImportPlan:
     if not selected:
         raise ValueError("请先选择要导入的包内会话")
     if package.package_catalog is None:
-        raise ValueError("此旧数据包只支持预览；请回到源电脑重新识别本地资料，并用新版导出后导入")
+        raise ValueError("此旧数据包只支持预览。请在会话库选中所需会话，使用「新建备份」生成经过账号检查的迁移包")
     verify_package(package.archive, progress, cancel)
     package = PackageLibrary(package.archive, cache)
     records = {r.uid: r for r in package.scan().records}
-    providers = {r.provider for r in selected}
-    if not providers <= PROVIDERS or not providers <= targets.keys():
+    providers = {records[r.uid].provider for r in selected if r.uid in records}
+    require_native_targets(providers)
+    portable = package.manifest.get("schema") == PORTABLE_SCHEMA
+    if portable:
+        check_portable(package.archive, check=lambda: check_cancel(cancel))
+    if not providers <= targets.keys():
         raise ValueError("请为每种来源选择目标资料目录")
     clean = {p: str(checked_directory(Path(targets[p]))) for p in sorted(providers)}
-    if "claude" in providers and targets.get("claude_desktop"):
-        clean["claude_desktop"] = str(checked_directory(Path(targets["claude_desktop"])))
     for p, v in clean.items():
         root = Path(v)
+        forbid_claude_directory(root)
         if within(package.archive, root) or within(cache, root):
             raise ValueError("迁移包和本工具缓存必须在目标资料之外")
         for other, path in clean.items():
             if p != other and (within(root, Path(path)) or within(Path(path), root)):
                 raise ValueError("不同来源的目标资料目录不能重叠")
-    live = native_processes(clean)
-    if live:
-        raise ValueError("请先正常退出原客户端，再预览导入：" + "、".join(live))
     before, existing, issues = {}, {}, {}
     reader = LocalLibrary(cache / "isolated-home", cache / "import-preview")
     for provider, value in clean.items():
         root = Path(value)
-        before[provider] = inventory(root, progress, cancel)
+        before[provider] = inventory(root, progress, cancel, codex_sessions=codex_sessions and provider == "codex")
         try:
             if provider == "claude_desktop":
                 existing[provider] = {str(json.loads(stable_bytes(p)).get("cliSessionId")) for p in root.glob("local_*.json")}
@@ -247,7 +406,11 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
             existing[provider] = set()
             issues[provider] = str(error)
     items, seen = [], {}
-    for selected_record in selected:
+    codex_row_shapes = set()
+    check_dsh_length = "deepseek" in providers and legacy_windows_paths()
+    step = f"预检会话及源日志（{len(selected)} 条）"
+    progress(step, 0)
+    for count, selected_record in enumerate(selected, 1):
         check_cancel(cancel)
         record = records.get(selected_record.uid)
         if record is None:
@@ -263,14 +426,31 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
                 item.update(action="skip", reason="目标已有相同 ID，保留目标记录并跳过")
             elif record.provider == "claude" and record.session_id in existing.get("claude_desktop", set()):
                 item.update(action="skip", reason="目标 Desktop 索引已有同一 Code 会话，未覆盖")
-            elif not item["cwd"] or not checked_directory(Path(item["cwd"])).is_dir():
+            elif not item["cwd"] or (not (project_dir := checked_directory(Path(item["cwd"]))).is_dir()
+                                     and project_dir not in expected_project_dirs):
                 raise ValueError("请将原项目映射到目标机已存在的项目目录")
-            elif record.provider in {"claude", "deepseek"} and not source_logs(package, record):
+            elif record.provider == "claude" and not source_logs(package, record):
                 raise ValueError("缺少可原生恢复的原始日志")
-            elif record.provider == "deepseek" and record.metadata.get("format_version") != 4:
-                raise ValueError("当前仅支持 DeepSeek v4 原生导入，其他代际仍可保全/预览")
+            elif record.provider == "deepseek":
+                if record.metadata.get("format_version") != 4:
+                    raise ValueError("当前仅支持 DeepSeek v4 原生导入，其他代际仍可保全/预览")
+                logs = [rel.name for _, rel in source_logs(package, record) if DSH_V4_LOG.fullmatch(rel.name)]
+                if not logs:
+                    raise ValueError("DeepSeek 缺少 v4 日志")
+                if len(logs) > 1:
+                    raise ValueError("DeepSeek 同一代际存在多个物理副本，请只保留明确的来源后导入")
+                if check_dsh_length:
+                    stage = stage_directory(Path(clean["deepseek"]), "0" * 32)
+                    log = dsh_log_destination(stage, item["cwd"], record.session_id, logs[0])
+                    too_long = any(len(str(path).encode("utf-16-le", errors="surrogatepass")) // 2 > limit
+                                   for path, limit in ((log, 259), (log.parent, 248)))
+                    if too_long:
+                        raise ValueError("Windows 当前的长路径设置无法暂存此 DeepSeek 会话，请改选较短的项目目录或 DSH 目标资料目录后重新预览")
             elif record.provider == "codex":
+                if not portable:
+                    raise ValueError("旧包需在会话库选择会话，再用新建导出生成经账号检查的迁移包")
                 native = native_rows(package, record)
+                item["codex_rollout"] = codex_rollout(package, record, native, cancel)
                 state, history = codex_databases(Path(clean["codex"]))
                 if any(r.get("table") in HISTORY_TABLES for r in native) and history is None:
                     raise ValueError("Codex 目标缺少分页历史数据库，请先用相容版本初始化")
@@ -278,9 +458,13 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
                     table = row.get("table")
                     if table not in STATE_TABLES | HISTORY_TABLES:
                         continue
+                    shape = (table, frozenset(row["row"]))
+                    if table != "thread_attachments" and shape in codex_row_shapes:
+                        continue
                     c = reader.snapshots.connect(history if table in HISTORY_TABLES else state)
                     try:
                         _check_row_shape(c, table, row["row"])
+                        codex_row_shapes.add(shape)
                         if table == "thread_attachments" and c.execute('SELECT 1 FROM thread_attachments WHERE id=?', (row["row"].get("id"),)).fetchone():
                             raise ValueError("目标存在同 ID 附件记录，未覆盖")
                     finally:
@@ -300,6 +484,7 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
         except (ValueError, OSError) as error:
             item.update(action="blocked", reason=str(error))
         items.append(item)
+        progress(step, 100 * count // len(selected))
     # A child must keep its parent relationship, rather than silently becoming a root.
     dependencies = {}
     for item in items:
@@ -314,6 +499,12 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
                 parent = rel.parts[2]
         elif record.provider == "codex":
             parent = record.metadata.get("parent_id")
+            if not parent:
+                raw_source = record.metadata.get("native_thread_metadata", {}).get("source", "")
+                if isinstance(raw_source, str) and raw_source.startswith("{"):
+                    source = json.loads(raw_source).get("subagent")
+                    if isinstance(source, dict):
+                        parent = source.get("thread_spawn", {}).get("parent_thread_id")
         elif record.provider == "deepseek":
             parent = next(package.raw_events(record), {}).get("parentSession")
         if parent:
@@ -335,7 +526,8 @@ def build_plan(package: PackageLibrary, selected: list[SessionRecord], targets: 
     clean = {p: v for p, v in clean.items() if p in active}
     before = {p: v for p, v in before.items() if p in active}
     return ImportPlan(str(package.archive), hash_file(package.archive), clean, before, items, mappings,
-                      ["导入会修改目标副本中的目录/索引字段；原包、正文与 thinking 保留。", "只恢复历史资料，不恢复登录、权限、Goals、队列或执行任务。", "Claude 支持本地 Claude Code 会话；云端聊天不属于此导入接口。", "Desktop 索引仅在包内有原始索引且选择了目标索引目录时恢复；其他情况恢复 Code 本地日志。", "项目工作文件不写入；历史正文中的旧路径保留。DeepSeek 会在原客户端重建显示缓存。"])
+                      ["Codex 和 DSH 恢复到目标机的本地资料库。", "Claude 历史通过会话库或接手页面只读查看。", "请完成项目映射，并在写入前正常退出参与恢复的客户端。"],
+                      codex_sessions)
 
 
 def _write_new(path: Path, data: bytes):
@@ -361,18 +553,43 @@ def _attachment_refs(value, mapping):
     if not isinstance(value, dict):
         return value
     result = dict(value)
-    if str(value.get("type", "")).lower() in {"image", "input_image", "image_url", "localimage", "file", "input_file", "imagefile"}:
+    if str(value.get("type", "")).lower() in ATTACHMENT_KINDS:
+        def location(raw):
+            uri = local_file_uri_path(raw)
+            if uri is not None:
+                return Path(mapping[uri]).as_uri() if uri in mapping else raw
+            return mapping.get(raw, raw)
+
         def locations(v):
             if isinstance(v, list):
                 return [locations(x) for x in v]
             if isinstance(v, dict):
-                return {k: mapping.get(x, x) if k in {"path", "file_path", "filePath", "localPath", "imagePath", "url"} and isinstance(x, str) else locations(x) for k, x in v.items()}
+                return {k: location(x) if k in ATTACHMENT_PATH_FIELDS and isinstance(x, str) else locations(x) for k, x in v.items()}
             return v
         return locations(value)
     for key in ["content", "message", "data", "item", "payload", "attachments", "images"]:
         if key in value:
             result[key] = _attachment_refs(value[key], mapping)
     return result
+
+
+def strip_claude_account_metadata(event: dict) -> int:
+    """Remove Mac account ownership from the transcript envelope and account attachments."""
+    removed = 0
+    for name in CLAUDE_ACCOUNT_FIELDS:
+        if name in event:
+            del event[name]
+            removed += 1
+    attachment = event.get("attachment")
+    if isinstance(attachment, dict):
+        if "organizationUuid" in attachment:
+            del attachment["organizationUuid"]
+            removed += 1
+        context = attachment.get("context")
+        if isinstance(context, dict) and "userEmail" in context:
+            del context["userEmail"]
+            removed += 1
+    return removed
 
 
 def _rewrite_log(source: Path, destination: Path, provider: str, cwd: str, cancel, sid, mapping=None):
@@ -398,16 +615,28 @@ def _rewrite_log(source: Path, destination: Path, provider: str, cwd: str, cance
                     original_offset += len(line)
                     event = json.loads(line)
                     changed = False
+                    if provider == "codex" and first:
+                        if event.get("type") != "session_meta" or event.get("payload", {}).get("id") != sid:
+                            raise ValueError("Codex 日志首条记录与会话 ID 不一致")
                     if provider == "deepseek" and first:
                         if event.get("type") != "session" or event.get("version") != 4 or event.get("id") != sid:
                             raise ValueError("DeepSeek 原生日志头不兼容")
                         event["cwd"] = cwd; changed = True
-                    elif provider == "claude" and "cwd" in event:
-                        event["cwd"] = cwd; changed = True
+                    elif provider == "claude":
+                        changed = bool(strip_claude_account_metadata(event))
+                        if "cwd" in event and event["cwd"] != cwd:
+                            event["cwd"] = cwd
+                            changed = True
                     elif provider == "codex" and event.get("type") == "session_meta":
-                        if event.get("payload", {}).get("id") != sid:
-                            raise ValueError("Codex 日志与会话 ID 不一致")
-                        event["payload"]["cwd"] = cwd; changed = True
+                        # A fork has its own first header and can carry earlier headers
+                        # from the inherited history. Scrub identities in every header.
+                        payload = event["payload"]
+                        payload["cwd"] = cwd
+                        for key in CODEX_CREATOR_FIELDS:
+                            payload.pop(key, None)
+                        if payload.get("runtime_workspace_roots"):
+                            payload["runtime_workspace_roots"] = [cwd]
+                        changed = True
                     elif provider == "codex" and event.get("type") == "turn_context":
                         payload = event.get("payload", {})
                         for key, value in {"cwd": cwd, "approval_policy": "on-request", "sandbox_policy": {"type": "read-only"}}.items():
@@ -473,13 +702,14 @@ def _insert(c: sqlite3.Connection, table: str, row: dict):
     c.execute(sql, [_decode_blob(row[n]) for n in names])
 
 
-def _codex_stage(package, items, root: Path, cancel):
+def _codex_stage(package, items, root: Path, cancel, progress):
     state, history = codex_databases(root, expected_root=Path(items[0]["target_root"]))
     connections = {"state": sqlite3.connect(state), "history": sqlite3.connect(history) if history else None}
     ids = {i["record"]["session_id"] for i in items}
     rows = []
     roots_by_project, project_map = {}, {}
     try:
+        thread_columns = {row[1] for row in connections["state"].execute("PRAGMA table_info(threads)")}
         available_ids = ids | {r[0] for r in connections["state"].execute("SELECT id FROM threads")}
         original_state, original_history = codex_databases(Path(items[0]["target_root"]))
         for key, c in connections.items():
@@ -488,7 +718,9 @@ def _codex_stage(package, items, root: Path, cancel):
                 original = original_history if key == "history" else original_state
                 snapshot = package.snapshots.sqlite(original)
                 c.execute("ATTACH DATABASE ? AS preserved", (str(snapshot),))
-        for item in items:
+        step = f"读取 Codex 原生记录（{len(items)} 条会话）"
+        progress(step, 0)
+        for count, item in enumerate(items, 1):
             record = SessionRecord.from_dict(item["record"])
             values = native_rows(package, record)
             pid = record.metadata.get("native_thread_metadata", {}).get("project_id")
@@ -496,10 +728,17 @@ def _codex_stage(package, items, root: Path, cancel):
                 project_map[pid] = str(uuid.uuid5(uuid.NAMESPACE_URL, "asm-project:" + item["cwd"]))
                 roots_by_project[pid] = item["cwd"]
             rows.extend((item, v) for v in values)
+            progress(step, 100 * count // len(items))
         seen = set()
         order = {"projects": 0, "project_roots": 1, "threads": 2, "thread_turns": 3, "thread_items": 4, "thread_history_projection_state": 5, "thread_realtime_items": 6, "thread_attachments": 7, "thread_spawn_edges": 8}
-        for item, entry in sorted(rows, key=lambda pair: order.get(pair[1].get("table"), 99)):
+        step = f"写入 Codex 原生记录（{len(rows)} 行待核对）"
+        percent = -1
+        for count, (item, entry) in enumerate(sorted(rows, key=lambda pair: order.get(pair[1].get("table"), 99))):
             check_cancel(cancel)
+            updated = 100 * count // len(rows)
+            if updated != percent:
+                percent = updated
+                progress(step, percent)
             table, row = entry.get("table"), dict(entry.get("row", {}))
             if table not in STATE_TABLES | HISTORY_TABLES:
                 continue  # no executable tools, Goals, migration SQL, queues or identities
@@ -512,7 +751,9 @@ def _codex_stage(package, items, root: Path, cancel):
             if table == "threads":
                 row["cwd"] = item["cwd"]
                 row["rollout_path"] = item.get("rollout_path", "")
-                for name, value in {"sandbox_policy": '{"type":"read-only"}', "approval_mode": "on-request", "memory_mode": "disabled", "daybreak_enabled": False, "creator_user_id": None, "creator_account_id": None, "thread_section_id": None}.items():
+                for name in thread_columns.intersection(CODEX_CREATOR_FIELDS):
+                    row[name] = None
+                for name, value in {"sandbox_policy": '{"type":"read-only"}', "approval_mode": "on-request", "memory_mode": "disabled", "daybreak_enabled": False, "thread_section_id": None}.items():
                     if name in row:
                         row[name] = value
                 if row.get("attached_thread_parent_id") not in available_ids:
@@ -526,7 +767,7 @@ def _codex_stage(package, items, root: Path, cancel):
                     row["item_json"] = json.dumps(remapped, ensure_ascii=False, separators=(",", ":"))
             if table == "thread_turns" and row.get("status") in {"inProgress", "in_progress", "running"}:
                 row["status"] = "interrupted"
-            for key in ["rollout_byte_offset", "rollout_end_byte_offset", "next_rollout_byte_offset"]:
+            for key in CODEX_ROLLOUT_OFFSETS:
                 if row.get(key) is not None and item.get("offset_map"):
                     if row[key] not in item["offset_map"]:
                         raise ValueError("Codex 分页偏移不对应完整日志边界，需重新导出稳定资料")
@@ -559,6 +800,9 @@ def _codex_stage(package, items, root: Path, cancel):
             if table == "project_roots" and c.execute("SELECT 1 FROM project_roots WHERE project_id=? AND position=?", (row["project_id"], row["position"])).fetchone():
                 continue
             _insert(c, table, row)
+        progress(step, 100)
+        step = "核验 Codex 数据库与既有记录"
+        progress(step, 0)
         for key, c in connections.items():
             if c:
                 tables = HISTORY_TABLES if key == "history" else STATE_TABLES
@@ -573,19 +817,25 @@ def _codex_stage(package, items, root: Path, cancel):
                     raise ValueError("Codex 暂存数据库存在未恢复的关联记录")
                 c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 c.execute("DETACH DATABASE preserved")
+        progress(step, 100)
     finally:
         for c in connections.values():
             if c:
                 c.close()
 
 
-def _stage_sessions(package, items, stages, cancel):
+def _stage_sessions(package, items, stages, cancel, progress=lambda *_: None, *, mappings):
+    require_native_targets(stages)
+    require_native_targets(item["record"]["provider"] for item in items)
     codex = []
-    for item in items:
+    step = f"在独立副本恢复原生会话（{len(items)} 条）"
+    progress(step, 0)
+    for count, item in enumerate(items, 1):
         record = SessionRecord.from_dict(item["record"])
         root = stages[record.provider]
         sid = safe_segment(record.session_id)
         logs = source_logs(package, record)
+        claude_cwd = item.get("claude_project_cwd", item["cwd"])
         attachment_map = {}
         for asset in entries_for(package, record):
             if "attachment" not in asset.get("role", ""):
@@ -603,14 +853,14 @@ def _stage_sessions(package, items, stages, cancel):
                 destination_asset = root / "attachments" / ("asm-" + sid) / (asset["object"].split("/")[-1] + suffix)
                 # Tool result paths owned by a Claude session remain at their canonical relative positions.
                 if record.provider == "claude" and rel and rel.parts[0] == "projects" and len(rel.parts) >= 4:
-                    project = re.sub(r"[^A-Za-z0-9]", "-", item["cwd"])
+                    project = re.sub(r"[^A-Za-z0-9]", "-", claude_cwd)
                     destination_asset = root / "projects" / project
                     destination_asset = destination_asset.joinpath(*rel.parts[2:])
             _copy_new(package._extract(asset["object"], destination_asset.name), destination_asset)
             attachment_map[original_path] = str(Path(item["target_root"]) / destination_asset.relative_to(root))
         item["attachment_map"] = attachment_map
         if record.provider == "claude":
-            project = re.sub(r"[^A-Za-z0-9]", "-", item["cwd"])
+            project = re.sub(r"[^A-Za-z0-9]", "-", claude_cwd)
             preferred = record.metadata.get("primary_file")
             chosen = next(((e, rel) for e, rel in logs if e.get("originalPath") == preferred), logs[0])
             e, original = chosen
@@ -634,26 +884,27 @@ def _stage_sessions(package, items, stages, cancel):
                     raise ValueError("Desktop 索引与 CLI 会话 ID 不一致")
                 allowed = {"sessionId", "cliSessionId", "title", "titleSource", "createdAt", "lastActivityAt", "lastFocusedAt", "isArchived", "model", "effort", "completedTurns", "lastAssistantUuid"}
                 data = {k: v for k, v in source_index.items() if k in allowed}
-                data.update(cwd=item["cwd"], originCwd=item["cwd"], permissionMode="default", isArchived=record.archived)
+                origin = claude_project_origin(item["cwd"], source_index, mappings)
+                data.update(cwd=item["cwd"], originCwd=str(origin), permissionMode="default", isArchived=record.archived)
                 _write_new(stages["claude_desktop"] / original_name, (json.dumps(data, ensure_ascii=False) + "\n").encode())
         elif record.provider == "deepseek":
-            destination = root / "sessions" / dsh_project_key(item["cwd"]) / sid
             # Only v4 is transformed; preserved historical generations stay in the package.
-            v4 = [(e, rel) for e, rel in logs if re.fullmatch(r"session\.v4\.jsonl(?:\.zstd)?", rel.name)]
+            v4 = [(e, rel) for e, rel in logs if DSH_V4_LOG.fullmatch(rel.name)]
             if not v4:
                 raise ValueError("DeepSeek 缺少 v4 日志")
             if len(v4) > 1:
                 raise ValueError("DeepSeek 同一代际存在多个物理副本，请只保留明确的来源后导入")
             e, original = v4[0]
-            _rewrite_log(package._extract(e["object"], original.name), destination / original.name, "deepseek", item["cwd"], cancel, sid, attachment_map)
+            log = dsh_log_destination(root, item["cwd"], sid, original.name)
+            _rewrite_log(package._extract(e["object"], original.name), log, "deepseek", item["cwd"], cancel, sid, attachment_map)
             item["source_session_dir"] = str(original.parent)
-            item["session_dir"] = str(destination)
+            item["session_dir"] = str(log.parent)
         else:
             rollout = None
             for e, rel in logs:
-                if rel.name.endswith((".jsonl", ".jsonl.zst")):
+                if e["object"] == item["codex_rollout"]:
                     moment = record.updated or time.time()
-                    name = "rollout-" + time.strftime("%Y-%m-%dT%H-%M-%S", time.gmtime(moment)) + "-" + sid + (".jsonl.zst" if rel.name.endswith(".zst") else ".jsonl")
+                    name = "rollout-" + time.strftime("%Y-%m-%dT%H-%M-%S", time.gmtime(moment)) + "-" + sid + (".jsonl.zst" if rel.name.endswith((".zst", ".zstd")) else ".jsonl")
                     rollout = root / ("archived_sessions" if record.archived else "sessions") / name
                     item["offset_map"] = _rewrite_log(package._extract(e["object"], rel.name), rollout, "codex", item["cwd"], cancel, sid, attachment_map)
                     break
@@ -663,8 +914,9 @@ def _stage_sessions(package, items, stages, cancel):
             if record.metadata.get("history_mode") != "paginated" and rollout is None:
                 raise ValueError("Codex 旧式历史缺少原始 rollout，不能伪造可续聊记录")
             codex.append(item)
+        progress(step, 100 * count // len(items))
     if codex:
-        _codex_stage(package, codex, stages["codex"], cancel)
+        _codex_stage(package, codex, stages["codex"], cancel, progress)
     if "deepseek" in stages:
         _dsh_registry(package, [i for i in items if i["record"]["provider"] == "deepseek"], stages["deepseek"])
 
@@ -698,28 +950,49 @@ def _dsh_registry(package, items, root):
     atomic_json(path, registry)
 
 
-def validate_staged(package, items, stages, cache):
-    reader = LocalLibrary(Path.home(), cache / "import-readback")
+def validate_staged(package, items, stages, cache, progress=lambda *_: None, cancel=None):
+    reader = LocalLibrary(cache / "isolated-home", cache / "import-readback")
     checks = []
+    step = f"回读会话历史（{len(items)} 条）"
+    progress(step, 0)
     for provider, root in stages.items():
         if provider == "claude_desktop":
             continue
         values = reader._scan_codex(root, db_root_override=root) if provider == "codex" else getattr(reader, "_scan_" + provider)(root)
         found = {r.session_id: r for r in values}
         for item in [i for i in items if i["record"]["provider"] == provider]:
+            check_cancel(cancel)
             source = SessionRecord.from_dict(item["record"])
             if source.session_id not in found:
                 raise ValueError("暂存原生索引中找不到导入会话")
             restored = found[source.session_id]
+            if provider == "codex":
+                index = restored.metadata.get("native_thread_metadata", {})
+                if any(index.get(key) is not None for key in CODEX_CREATOR_FIELDS):
+                    raise ValueError("Codex 暂存索引仍含源账号归属")
+                for file in restored.files:
+                    payload = header(Path(file)).get("payload", {})
+                    if any(key in payload for key in CODEX_CREATOR_FIELDS):
+                        raise ValueError("Codex 暂存日志头仍含源账号归属")
             original_page = package.page(source, 100)
             restored_page = reader.page(restored, 100)
             if original_page.total != restored_page.total or restored_page.warnings:
                 raise ValueError("暂存原生历史回读与包内历史不一致，未发布")
+            if provider == "claude" and not restored.cwd:
+                # The catalog preview only looks at the first few records. A
+                # transcript can start with many snapshots without a cwd.
+                with closing(open_lines(Path(restored.files[0]))) as events:
+                    for event in events:
+                        check_cancel(cancel)
+                        if event.get("cwd"):
+                            restored.cwd = str(event["cwd"])
+                            break
             if restored.cwd != item["cwd"]:
-                raise ValueError("暂存项目路径映射核验失败")
+                raise ValueError("暂存项目路径映射核验失败：" + source.session_id)
             if [(m.kind, m.text) for m in original_page.messages if m.kind == "thinking"] != [(m.kind, m.text) for m in restored_page.messages if m.kind == "thinking"]:
                 raise ValueError("暂存 thinking 回读不一致，未发布")
             checks.append({"provider": provider, "messages": restored_page.total, "historyReadback": True})
+            progress(step, 100 * len(checks) // len(items))
     return checks
 
 
@@ -745,6 +1018,73 @@ def rename_new(source: Path, target: Path):
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def windows_artifact_archive(path: Path):
+    if sys.platform != "win32" or path.parent != Path.home():
+        return None
+    if not re.fullmatch(r"\.asm-(?:before|stage|undone)-[a-f0-9]{32}-\.(?:codex|claude|dsh)", path.name):
+        return None
+    return Path.home() / "AppData" / "Local" / "AI-Session-Migration" / "restore-residue" / path.name
+
+
+def retained_snapshot(entry):
+    original = Path(entry["beforePath"])
+    if original.exists():
+        return original
+    archived = windows_artifact_archive(original)
+    if archived is not None and archived.exists():
+        return checked_directory(archived)
+    return original
+
+
+def archive_terminal_artifacts(report):
+    """Consolidate Windows home-directory artifacts after a transaction is terminal."""
+    result = {"moved": {}, "errors": {}}
+    token = report.get("token", "")
+    safe = {
+        "complete": report.get("backupVerified") and report.get("targetReadbackVerified"),
+        "rolled-back": report.get("rollbackVerified"),
+        "aborted-before-publish": report.get("targetUnmodifiedByImport"),
+    }
+    if not safe.get(report["status"]) or not re.fullmatch(r"[a-f0-9]{32}", token):
+        return result
+    for entry in report["roots"]:
+        name = WINDOWS_CLIENT_HOMES.get(entry["provider"])
+        if name is None or Path(entry["target"]) != Path.home() / name:
+            continue
+        for label, key in (("before", "beforePath"), ("stage", "stage"), ("undone", "undonePath")):
+            source = Path.home() / f".asm-{label}-{token}-{name}"
+            if entry.get(key) != str(source):
+                continue
+            target = windows_artifact_archive(source)
+            if target is None or not source.exists():
+                continue
+            try:
+                if checked_directory(source) != source or checked_directory(target) != target:
+                    raise ValueError("归档路径解析后发生变化")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                before = source.lstat()
+                if before.st_dev != target.parent.stat().st_dev:
+                    raise ValueError("归档目录与原目录必须在同一卷")
+                rename_new(source, target)
+                after = target.lstat()
+                if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+                    raise ValueError("归档目录文件标识回读失败")
+                result["moved"][str(source)] = str(target)
+            except (OSError, ValueError) as error:
+                result["errors"][str(source)] = str(error)
+    return result
+
+
+def record_archived_artifacts(report_path, report):
+    result = archive_terminal_artifacts(report)
+    if result["moved"] or result["errors"]:
+        report["artifactArchive"] = result
+        try:
+            atomic_json(report_path, report)
+        except OSError as error:
+            report.setdefault("warnings", []).append("归档结果写回失败：" + str(error))
 
 
 @contextmanager
@@ -780,10 +1120,155 @@ def validate_backup_location(plan, backup_directory, cache):
     for value in plan.targets.values():
         if within(backup_directory, Path(value)) or within(cache, Path(value)):
             raise ValueError("目标备份和本工具缓存必须放在目标资料目录之外")
+    forbid_client_storage(backup_directory)
     return backup_directory
 
 
+def preview_import_space(plan, package, backup_directory):
+    """Group concurrent staging and backup allocations by their actual volumes."""
+    if not plan.ready:
+        return []
+    volumes = {}
+
+    def add(location, staging=0, backup=0, incoming=0):
+        directory = next((p for p in (location, *location.parents) if p.is_dir()), None)
+        if directory is None:
+            raise ValueError("备份位置或目标所在磁盘不可用，请重新连接后预览")
+        device = directory.stat().st_dev
+        available = shutil.disk_usage(directory).free
+        group = volumes.setdefault(device, {"locations": [], "stagingBytes": 0, "backupBytes": 0,
+                                            "incomingBytes": 0, "availableBytes": available})
+        group["locations"].append(str(location))
+        group["stagingBytes"] += staging
+        group["backupBytes"] += backup
+        group["incomingBytes"] += incoming
+        group["availableBytes"] = min(group["availableBytes"], available)
+
+    selected = {}
+    for item in plan.ready:
+        record = item["record"]
+        selected.setdefault(record["provider"], set()).add(record["uid"])
+    payload = {provider: 0 for provider in selected}
+    for entry in package.entries.values():
+        role = entry.get("role", "")
+        if role not in {"original-session", "native-database-rows"} and "attachment" not in role:
+            continue
+        owners = {entry.get("sessionUid"), *entry.get("sessionUids", ())}
+        for provider, uids in selected.items():
+            if owners & uids:
+                payload[provider] += entry["size"]
+
+    existing = {provider: sum(item.get("bytes", 0) for item in plan.before[provider]["files"].values())
+                for provider in plan.targets}
+    for provider, root in plan.targets.items():
+        add(Path(root).parent, staging=existing[provider], incoming=payload.get(provider, 0))
+    add(Path(backup_directory), backup=sum(existing.values()))
+    for volume in volumes.values():
+        volume["locations"] = list(dict.fromkeys(volume["locations"]))
+        volume["minimumBytes"] = volume["stagingBytes"] + volume["backupBytes"] + 128 * CHUNK
+        volume["estimatedBytes"] = volume["minimumBytes"] + volume["incomingBytes"]
+        volume["enough"] = volume["availableBytes"] >= volume["minimumBytes"]
+    return list(volumes.values())
+
+
+def session_only_changes(provider, before, after):
+    prefixes = {
+        "claude": ("projects/", "attachments/"),
+        "claude_desktop": (),
+        "codex": ("sessions/", "archived_sessions/", "attachments/"),
+        "deepseek": ("sessions/", "attachments/"),
+    }[provider]
+    changed = {name for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
+    for name in changed:
+        allowed = name.startswith(prefixes)
+        if provider == "codex":
+            allowed |= bool(CODEX_INDEX.fullmatch(name))
+        if provider == "deepseek":
+            allowed |= name in {"storages/", "storages/workspace.json"}
+        if provider == "claude_desktop":
+            allowed |= bool(re.fullmatch(r"local_[A-Za-z0-9_-]+\.json", name))
+        if not allowed:
+            raise ValueError(f"暂存变更超出会话资料范围：{provider}/{name}")
+
+
+def by_top_level(tree):
+    units = {}
+    for name, info in tree["files"].items():
+        units.setdefault(name.split("/", 1)[0], {})[name] = info
+    return units
+
+
+def codex_changes(entry):
+    before = by_top_level(entry["before"])
+    after = by_top_level(entry.get("after", entry["before"]))
+    changed = sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
+    return before, after, changed
+
+
+def publish_codex_sessions(entry, report, report_path, fault, progress=lambda *_: None):
+    root, stage, old = map(Path, (entry["target"], entry["stage"], entry["beforePath"]))
+    before, after, changed = codex_changes(entry)
+    old.mkdir(mode=0o700)
+    for name in changed:
+        entry.update(phase="moving-original", activeUnit=name)
+        atomic_json(report_path, report)
+        if name in before:
+            rename_new(root / name, old / name)
+        entry["phase"] = "moving-stage"
+        atomic_json(report_path, report)
+        if fault:
+            fault("before-publish-codex")
+        if name in after:
+            rename_new(stage / name, root / name)
+    entry.pop("activeUnit", None)
+    entry["phase"] = "published"
+    atomic_json(report_path, report)
+    if inventory(root, progress, codex_sessions=True) != entry["after"]:
+        raise ValueError("Codex 发布后的会话资料校验失败")
+    retained = {name: before[name] for name in changed if name in before}
+    if by_top_level(inventory(old, progress, codex_sessions=True)) != retained:
+        raise ValueError("Codex 原会话资料在发布时发生变化")
+
+
+def inspect_codex_rollback(entry):
+    root, old = Path(entry["target"]), retained_snapshot(entry)
+    if not root.is_dir():
+        raise ValueError("Codex 目标目录已改变，无法自动回滚会话")
+    before, after, changed = codex_changes(entry)
+    current = by_top_level(inventory(root, codex_sessions=True))
+    retained = by_top_level(inventory(old, codex_sessions=True))
+    if not set(retained) <= set(changed):
+        raise ValueError("Codex 回滚副本包含本批未替换的文件")
+    for name in before.keys() | current.keys() | after.keys():
+        b, a = before.get(name), after.get(name)
+        live, saved = current.get(name), retained.get(name)
+        allowed = ((b, None), (None, b), (a, b)) if name in changed else ((b, None),)
+        if (live, saved) not in allowed:
+            raise ValueError("Codex 会话资料已变化，保留所有副本并停止自动回滚")
+    return before, current, retained, changed
+
+
+def rollback_codex_sessions(entry, token):
+    root, old = Path(entry["target"]), retained_snapshot(entry)
+    before, current, retained, changed = inspect_codex_rollback(entry)
+    parked = root.with_name(".asm-undone-" + token + "-" + root.name)
+    for name in reversed(changed):
+        if name in current and current[name] != before.get(name):
+            parked.mkdir(exist_ok=True, mode=0o700)
+            checked_directory(parked)
+            rename_new(root / name, parked / name)
+            entry["undonePath"] = str(parked)
+        if name in retained:
+            rename_new(old / name, root / name)
+    if inventory(root, codex_sessions=True) != entry["before"]:
+        raise ValueError("Codex 回滚后的会话资料与原目标不一致")
+
+
 def execute_import(plan: ImportPlan, backup_directory: Path, cache: Path, *, confirmed_offline=False, progress=lambda *_: None, cancel=None, fault=None):
+    require_native_targets(plan.targets)
+    require_native_targets(item["record"]["provider"] for item in plan.ready)
+    for value in plan.targets.values():
+        forbid_claude_directory(value)
     if not confirmed_offline:
         raise ValueError("请先确认所有目标客户端与后台任务已正常退出")
     if not plan.ready:
@@ -795,58 +1280,56 @@ def execute_import(plan: ImportPlan, backup_directory: Path, cache: Path, *, con
     with target_locks(plan.targets, cache):
         if hash_file(Path(plan.archive)) != plan.archive_sha256:
             raise ValueError("迁移包在预览后已变化，请重新预览")
+        source = PackageLibrary(Path(plan.archive), cache)
+        actual = {r.uid: r for r in source.scan().records}
+        for item in plan.ready:
+            record = item["record"]
+            parsed = actual.get(record["uid"])
+            if parsed is None or parsed.provider != record["provider"] or parsed.session_id != record["session_id"]:
+                raise ValueError("已保存计划和迁移包内会话不一致，请重新预览")
+            if not checked_directory(Path(item["cwd"])).is_dir():
+                raise ValueError("目标项目目录尚未准备好或已改变，请重新预览")
+        if any(item["record"]["provider"] == "codex" for item in plan.ready):
+            check_portable(source.archive, check=lambda: check_cancel(cancel))
         for provider, value in plan.targets.items():
-            if inventory(Path(value), progress, cancel) != plan.before[provider]:
+            if inventory(Path(value), progress, cancel, codex_sessions=plan.codex_sessions and provider == "codex") != plan.before[provider]:
                 raise ValueError("目标资料在预览后已变化，请重新预览；尚未写入")
+        volumes = preview_import_space(plan, source, backup_directory)
+        if any(not volume["enough"] for volume in volumes):
+            raise ValueError("目标暂存或完整备份空间不足，请更改位置后重新预览")
         token = uuid.uuid4().hex
         output = backup_directory / ("导入恢复-" + time.strftime("%Y%m%d-%H%M%S") + "-" + token)
         output.mkdir(parents=True, mode=0o700)
         report_path = output / "导入结果.json"
-        report = {"schema": SCHEMA, "token": token, "status": "backing-up", "output": str(output), "journal": str(report_path), "startedAt": time.time(), "roots": [], "imported": len(plan.ready), "skipped": len(plan.items) - len(plan.ready), "modelVerified": False, "realWindowsVerified": False, "thinkingTransform": False, "backupVerified": False, "warnings": list(plan.warnings)}
+        report = {"schema": SCHEMA, "token": token, "status": "staging", "output": str(output), "journal": str(report_path), "startedAt": time.time(), "roots": [], "imported": len(plan.ready), "skipped": len(plan.items) - len(plan.ready), "modelVerified": False, "realWindowsVerified": False, "thinkingTransform": False, "backupVerified": False, "warnings": list(plan.warnings), "spaceBeforeStaging": volumes}
+        report["items"] = [
+            {"provider": item["record"]["provider"], "title": item["record"]["title"],
+             "action": item["action"], "reason": item["reason"]}
+            for item in plan.items
+        ]
         atomic_json(output / "冲突预览.json", plan.to_dict())
         atomic_json(report_path, report)
+        publication_started = False
         try:
-            estimated = sum(f.get("bytes", 0) for tree in plan.before.values() for f in tree["files"].values())
-            if shutil.disk_usage(output).free < estimated + 128 * CHUNK:
-                raise ValueError("目标备份位置空间不足，未写入客户端资料")
-            archive = output / "目标资料完整备份.zip"
-            with zipfile.ZipFile(archive, "x", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as z:
-                for provider, tree in plan.before.items():
-                    root = Path(plan.targets[provider])
-                    for name, info in tree["files"].items():
-                        check_cancel(cancel)
-                        progress("备份目标资料 " + provider, 0)
-                        z.write(root / name.rstrip("/"), provider + "/" + name)
-                z.writestr("asm-target-inventory.json", json.dumps(plan.before, ensure_ascii=False))
-            archive.chmod(0o600)
-            with archive.open("r+b") as f:
-                os.fsync(f.fileno())
-            with zipfile.ZipFile(archive) as z:
-                import hashlib
-                for provider, tree in plan.before.items():
-                    for name, info in tree["files"].items():
-                        check_cancel(cancel)
-                        if info.get("directory"):
-                            continue
-                        with z.open(provider + "/" + name) as f:
-                            if hashlib.file_digest(f, "sha256").hexdigest() != info["sha256"]:
-                                raise ValueError("目标备份回读失败，未写入客户端资料")
-            report.update(backupVerified=True, backup=str(archive), backupSha256=hash_file(archive), status="staging")
-            atomic_json(report_path, report)
             stages = {}
             for provider, value in plan.targets.items():
                 check_cancel(cancel)
                 root = Path(value)
-                stage = root.with_name(".asm-stage-" + token + "-" + root.name)
+                stage = stage_directory(root, token)
                 old = root.with_name(".asm-before-" + token + "-" + root.name)
                 root.parent.mkdir(parents=True, exist_ok=True)
                 stage.mkdir(mode=0o700)
                 stages[provider] = stage
                 entry = {"provider": provider, "target": str(root), "stage": str(stage), "beforePath": str(old), "before": plan.before[provider], "phase": "staging"}
+                if provider == "codex" and plan.codex_sessions:
+                    entry["scope"] = "codex-sessions"
                 report["roots"].append(entry); atomic_json(report_path, report)
                 if shutil.disk_usage(stage).free < sum(f.get("bytes", 0) for f in plan.before[provider]["files"].values()) + 128 * CHUNK:
                     raise ValueError("目标磁盘缺少独立暂存空间，未写入客户端资料")
-                for name, info in plan.before[provider]["files"].items():
+                files = plan.before[provider]["files"]
+                step = f"复制 {provider} 目标资料（{len(files)} 项）"
+                progress(step, 0 if files else 100)
+                for count, (name, info) in enumerate(files.items(), 1):
                     check_cancel(cancel)
                     p = stage / name.rstrip("/")
                     if info.get("directory"):
@@ -855,28 +1338,71 @@ def execute_import(plan: ImportPlan, backup_directory: Path, cache: Path, *, con
                         p.parent.mkdir(parents=True, exist_ok=True)
                         independent_copy(root / name, p)
                     p.chmod(info["mode"])
+                    progress(step, 100 * count // len(files))
                 if inventory(stage, progress, cancel)["files"] != plan.before[provider]["files"]:
                     raise ValueError("目标暂存副本校验失败，未发布")
             items = json.loads(json.dumps(plan.ready))
             for item in items:
                 item["target_root"] = plan.targets[item["record"]["provider"]]
-            progress("在独立副本恢复原生会话", 0)
             package = PackageLibrary(Path(plan.archive), cache)
-            _stage_sessions(package, items, stages, cancel)
-            report["nativeReadback"] = validate_staged(package, items, stages, cache)
+            _stage_sessions(package, items, stages, cancel, progress, mappings=plan.mappings)
+            report["nativeReadback"] = validate_staged(package, items, stages, cache, progress, cancel)
             for entry in report["roots"]:
                 entry["after"] = inventory(Path(entry["stage"]), progress, cancel)
+                session_only_changes(entry["provider"], entry["before"]["files"], entry["after"]["files"])
             if fault:
                 fault("staged")
+            if native_processes(plan.targets):
+                raise ValueError("目标客户端已启动，未发布副本")
+
+            # A bad source batch only costs staging. Verify the original backup
+            # before the first write to the native target.
+            report["status"] = "backing-up"
+            atomic_json(report_path, report)
+            estimated = sum(f.get("bytes", 0) for tree in plan.before.values() for f in tree["files"].values())
+            if shutil.disk_usage(output).free < estimated + 128 * CHUNK:
+                raise ValueError("目标备份位置空间不足，未写入客户端资料")
+            archive = output / ("目标会话资料备份.zip" if plan.codex_sessions and "codex" in plan.targets else "目标资料完整备份.zip")
+            with zipfile.ZipFile(archive, "x", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as z:
+                for provider, tree in plan.before.items():
+                    root = Path(plan.targets[provider])
+                    total = len(tree["files"])
+                    step = f"备份 {provider} 目标资料（{total} 项）"
+                    progress(step, 0 if total else 100)
+                    for count, name in enumerate(tree["files"], 1):
+                        check_cancel(cancel)
+                        z.write(root / name.rstrip("/"), provider + "/" + name)
+                        progress(step, 100 * count // total)
+                z.writestr("asm-target-inventory.json", json.dumps(plan.before, ensure_ascii=False))
+            archive.chmod(0o600)
+            with archive.open("r+b") as f:
+                os.fsync(f.fileno())
+            with zipfile.ZipFile(archive) as z:
+                import hashlib
+                for provider, tree in plan.before.items():
+                    files = [(name, info) for name, info in tree["files"].items() if not info.get("directory")]
+                    step = f"回读 {provider} 目标备份（{len(files)} 个文件）"
+                    progress(step, 0 if files else 100)
+                    for count, (name, info) in enumerate(files, 1):
+                        check_cancel(cancel)
+                        with z.open(provider + "/" + name) as f:
+                            if hashlib.file_digest(f, "sha256").hexdigest() != info["sha256"]:
+                                raise ValueError("目标备份回读失败，未写入客户端资料")
+                        progress(step, 100 * count // len(files))
+            report.update(backupVerified=True, backup=str(archive), backupSha256=hash_file(archive))
             for provider, value in plan.targets.items():
-                if inventory(Path(value), progress, cancel) != plan.before[provider]:
+                if inventory(Path(value), progress, cancel, codex_sessions=plan.codex_sessions and provider == "codex") != plan.before[provider]:
                     raise ValueError("目标客户端资料发生变化，未发布任何副本，请退出后重新预览")
             if native_processes(plan.targets):
                 raise ValueError("目标客户端已启动，未发布副本")
             check_cancel(cancel)
             report["status"] = "publishing"; atomic_json(report_path, report)
+            publication_started = True
             # Publication is a short non-cancellable boundary; durable journal precedes each rename.
             for entry in report["roots"]:
+                if entry.get("scope") == "codex-sessions":
+                    publish_codex_sessions(entry, report, report_path, fault, progress)
+                    continue
                 root, stage, old = map(Path, [entry["target"], entry["stage"], entry["beforePath"]])
                 entry["phase"] = "moving-original"; atomic_json(report_path, report)
                 if entry["before"]["exists"]:
@@ -886,43 +1412,60 @@ def execute_import(plan: ImportPlan, backup_directory: Path, cache: Path, *, con
                     fault("before-publish-" + entry["provider"])
                 rename_new(stage, root)
                 entry["phase"] = "published"; atomic_json(report_path, report)
-                if inventory(root) != entry["after"]:
+                if inventory(root, progress) != entry["after"]:
                     raise ValueError("发布后的目标核验失败")
-                if entry["before"]["exists"] and inventory(old) != entry["before"]:
+                if entry["before"]["exists"] and inventory(old, progress) != entry["before"]:
                     raise ValueError("原目标在发布期间发生变化，保留两份资料并停止")
             report.update(status="complete", finishedAt=time.time(), targetReadbackVerified=True)
             atomic_json(report_path, report)
+            record_archived_artifacts(report_path, report)
             return report
         except BaseException as error:
-            report.update(status="failed", error=type(error).__name__ + "：" + str(error))
-            atomic_json(report_path, report)
-            try:
-                report = _rollback(report_path, progress)
-                report["error"] = type(error).__name__ + "：" + str(error)
+            reason = type(error).__name__ + "：" + str(error)
+            if not publication_started:
+                report.update(status="aborted-before-publish", error=reason,
+                              targetUnmodifiedByImport=True, finishedAt=time.time())
                 atomic_json(report_path, report)
-            except Exception as recovery_error:
-                report.update(status="needs-attention", recoveryError=str(recovery_error))
+                record_archived_artifacts(report_path, report)
+            else:
+                report.update(status="failed", error=reason)
                 atomic_json(report_path, report)
+                try:
+                    report = _rollback(report_path, progress)
+                    report["error"] = reason
+                    atomic_json(report_path, report)
+                except Exception as recovery_error:
+                    report.update(status="needs-attention", recoveryError=str(recovery_error))
+                    atomic_json(report_path, report)
             error.report = report
             raise
 
 
 def _rollback(report_path: Path, progress=lambda *_: None):
+    forbid_client_storage(report_path.parent)
     report = json.loads(stable_bytes(report_path, 256 * CHUNK))
     if report.get("schema") != SCHEMA or not re.fullmatch(r"[a-f0-9]{32}", report.get("token", "")):
         raise ValueError("导入恢复记录不受支持")
     token = report["token"]
-    if report["status"] == "rolled-back":
+    if report["status"] in {"rolled-back", "aborted-before-publish"}:
         return report
     roots = report["roots"]
+    require_native_targets(e["provider"] for e in roots)
+    for entry in roots:
+        forbid_claude_directory(entry["target"])
     if native_processes({e["provider"]: e["target"] for e in roots}):
         raise ValueError("请退出目标客户端后再撤销/恢复")
     # Validate every target before changing any directory.
     for e in roots:
         root = checked_directory(Path(e["target"]))
-        if Path(e["stage"]) != root.with_name(".asm-stage-" + token + "-" + root.name) or Path(e["beforePath"]) != root.with_name(".asm-before-" + token + "-" + root.name):
+        if Path(e["stage"]) != stage_directory(root, token) or Path(e["beforePath"]) != root.with_name(".asm-before-" + token + "-" + root.name):
             raise ValueError("恢复记录路径不匹配，未更改资料")
-        old = Path(e["beforePath"])
+        if e.get("scope") == "codex-sessions":
+            if e["provider"] != "codex":
+                raise ValueError("恢复记录的 Codex 会话范围不匹配")
+            inspect_codex_rollback(e)
+            continue
+        old = retained_snapshot(e)
         if old.exists() and inventory(old) != e["before"]:
             raise ValueError("原目标副本已变化，保留所有副本并停止自动恢复")
         if root.exists():
@@ -933,7 +1476,12 @@ def _rollback(report_path: Path, progress=lambda *_: None):
             raise ValueError("原目标副本缺失，未作不完整恢复")
     report["status"] = "rolling-back"; atomic_json(report_path, report)
     for e in reversed(roots):
-        root, old = Path(e["target"]), Path(e["beforePath"])
+        if e.get("scope") == "codex-sessions":
+            rollback_codex_sessions(e, token)
+            e["phase"] = "restored"; atomic_json(report_path, report)
+            progress("恢复原 Codex 会话资料", 100)
+            continue
+        root, old = Path(e["target"]), retained_snapshot(e)
         if root.exists() and inventory(root) == e.get("after"):
             parked = root.with_name(".asm-undone-" + token + "-" + root.name)
             rename_new(root, parked)
@@ -943,9 +1491,10 @@ def _rollback(report_path: Path, progress=lambda *_: None):
         if inventory(root) != e["before"]:
             raise ValueError("恢复后资料与原目标不一致，所有副本已保留")
         e["phase"] = "restored"; atomic_json(report_path, report)
-        progress("恢复原目标 " + e["provider"], 0)
+        progress("恢复原目标 " + e["provider"], 100)
     report.update(status="rolled-back", rollbackVerified=True, finishedAt=time.time())
     atomic_json(report_path, report)
+    record_archived_artifacts(report_path, report)
     return report
 
 
@@ -954,5 +1503,6 @@ def rollback_import(report_path: Path, cache: Path, *, confirmed_offline=False, 
         raise ValueError("请先确认目标客户端已正常退出")
     report = json.loads(stable_bytes(report_path, 256 * CHUNK))
     targets = {e["provider"]: e["target"] for e in report.get("roots", [])}
+    require_native_targets(targets)
     with target_locks(targets, cache):
         return _rollback(report_path, progress)

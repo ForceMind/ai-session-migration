@@ -82,10 +82,14 @@ class CoreTest(unittest.TestCase):
         with zipfile.ZipFile(report['portable']) as z:
             manifest = json.loads(z.read('manifest.json'))
             self.assertFalse(any(e.get('originalPath', '').endswith('.credentials.yaml') for e in manifest['entries']))
-            c = next(e for e in manifest['entries'] if e.get('originalPath') == str(self.files['claude']))
-            self.assertEqual(z.read(c['object']), self.files['claude'].read_bytes())
-            d = next(e for e in manifest['entries'] if e.get('originalPath') == str(self.files['deepseek']))
-            self.assertEqual(z.read(d['object']), self.files['deepseek'].read_bytes())
+            self.assertTrue(any(e["role"] == "claude-reading" for e in manifest["entries"]))
+            self.assertFalse(any(e["role"] == "claude-desktop-index" for e in manifest["entries"]))
+        original = decrypt_for_preview(Path(report["encrypted"]), key, self.base / "raw-cache")
+        with zipfile.ZipFile(original) as z:
+            manifest = json.loads(z.read("manifest.json"))
+            for source in (self.files["claude"], self.files["deepseek"]):
+                entry = next(e for e in manifest["entries"] if e.get("originalPath") == str(source))
+                self.assertEqual(z.read(entry["object"]), source.read_bytes())
         self.assertEqual(before, fingerprints(self.home))
 
     def test_key_never_overwritten_and_wrong_key_rejected(self):
@@ -170,7 +174,7 @@ class CoreTest(unittest.TestCase):
         decoded=decrypt_for_preview(archive,key,self.base/'old-cache',auth_path=auth)
         self.assertEqual(decoded.read_bytes(),plain)
 
-    def test_finished_archive_can_resume_after_encryption_failure(self):
+    def test_encryption_failure_never_publishes_unencrypted_original(self):
         from unittest.mock import patch
         records=self.library.scan().records
         before=fingerprints(self.home)
@@ -179,12 +183,10 @@ class CoreTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as failure:
                 make_backup(self.library,records,self.base/'backups',key)
         report=failure.exception.report
-        self.assertTrue(report['archiveReady'])
-        self.assertTrue(Path(report['pendingArchive']).is_file())
-        recovered=resume_backup(report,key,protected_roots=[self.home/'.claude',self.home/'.codex',self.home/'.dsh'])
-        self.assertEqual(recovered['status'],'complete')
-        self.assertTrue(recovered['encryptedReadbackVerified'])
-        self.assertTrue(verify_package(Path(recovered['portable']))['verified'])
+        self.assertEqual(report["status"], "failed")
+        self.assertFalse(report.get("portable"))
+        files = list(Path(report["output"]).iterdir())
+        self.assertEqual([p.name for p in files], ["结果.json"])
         self.assertEqual(before,fingerprints(self.home))
 
     def test_optional_project_work_files_exclude_git_and_separate_credentials(self):
@@ -214,9 +216,10 @@ class CoreTest(unittest.TestCase):
         package=PackageLibrary(Path(first['portable']),self.base/'view');subset=[r for r in package.scan().records if r.provider=='claude']
         second=make_backup(package,subset,self.base/'reexport',key)
         with zipfile.ZipFile(second['portable']) as z:
-            entries=json.loads(z.read('manifest.json'))['entries'];original=next(e for e in entries if e.get('role')=='original-session')
-            self.assertEqual(original['originalPath'],str(self.files['claude']))
-            self.assertEqual(z.read(original['object']),self.files['claude'].read_bytes())
+            entries = json.loads(z.read("manifest.json"))["entries"]
+            original = next(e for e in entries if e["role"] == "claude-reading")
+            self.assertTrue(original["originalPath"].startswith("/readings/"))
+            self.assertIn(b"## 1", z.read(original["object"]))
             self.assertFalse(json.loads(z.read('catalog.json'))['registries'])
 
 

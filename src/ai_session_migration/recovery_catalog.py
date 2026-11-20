@@ -373,12 +373,12 @@ class RecoveryCatalog:
         with self._member(archive, name) as stream:
             metadata = self._stage_manifest(owner, stream, cancel)
         schema = metadata.get('schema')
-        known = {'ai-session-migration-gui-1': 'sessions', 'asm-complete-native-databases-1': 'databases',
+        known = {'ai-session-migration-gui-1': 'sessions', 'ai-session-migration-gui-2': 'sessions', 'asm-complete-native-databases-1': 'databases',
                  'asm-old-validation-snapshots-1': 'snapshots', 'conversation-migration-1': group['category']}
         if schema is not None:
             if schema not in known: raise UnsupportedFormat('备份清单版本尚未支持')
             group['category'] = known[schema]
-            if schema == 'ai-session-migration-gui-1' and not group.get('native_archive'):
+            if schema in {'ai-session-migration-gui-1', 'ai-session-migration-gui-2'} and not group.get('native_archive'):
                 group['native_archive'] = str(archive)
         if metadata.get('kind') == 'mac-full-preservation': group['category'] = 'applications'
         for row in self.db.execute('SELECT data FROM manifest_entries WHERE owner=? ORDER BY ordinal', (owner,)):

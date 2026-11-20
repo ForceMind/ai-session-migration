@@ -11,10 +11,10 @@ import re
 import sqlite3
 import tomllib
 import copy
-from urllib.parse import urlparse, unquote
 from typing import Iterator
 
 from .models import Attachment, Catalog, Message, SessionPage, SessionRecord, identity
+from .attachments import ATTACHMENT_KINDS, ATTACHMENT_PATH_FIELDS, local_file_uri_path
 from .safeio import SnapshotStore, header, open_lines, read_json, walk_files, within, stable_bytes, owned_file, directory_issue, remote_path
 
 
@@ -465,11 +465,10 @@ class LocalLibrary:
         def markdown_images(text):
             for match in re.finditer(r"!\[([^\]]*)\]\(([^\n]+?)\)", text):
                 value = match[2].strip().strip("<>")
-                if value.startswith("file:"):
-                    url = urlparse(value)
-                    if url.netloc not in {"", "localhost"}:
+                if value.lower().startswith("file:"):
+                    value = local_file_uri_path(value)
+                    if value is None:
                         continue
-                    value = unquote(url.path)
                 f = Path(value)
                 if f.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"} and any(owned_file(f, root) for root in roots):
                     output.append(Attachment(match[1] or f.name, str(f)))
@@ -480,7 +479,7 @@ class LocalLibrary:
                 t = value.get("type", "")
                 if t in ("text", "input_text", "output_text") and isinstance(value.get("text"), str):
                     markdown_images(value["text"])
-                if isinstance(t, str) and t in {"image", "input_image", "localImage", "document"}:
+                if isinstance(t, str) and t.lower() in ATTACHMENT_KINDS:
                     attachment = value.get("attachment", {})
                     if record.provider == "deepseek" and isinstance(attachment, dict):
                         aid = str(attachment.get("attachmentId", ""))
@@ -490,9 +489,17 @@ class LocalLibrary:
                     src = value.get("source", {})
                     if include_embedded and isinstance(src, dict) and src.get("type") == "base64" and isinstance(src.get("data"), str) and len(src["data"]) < 28 * 1024 * 1024:
                         output.append(Attachment("会话内嵌图片", kind="embedded", data=src["data"], media_type=str(src.get("media_type", "image/png"))))
-                    for key in ["path", "file_path", "filePath"]:
-                        p = value.get(key) or (src.get(key) if isinstance(src, dict) else None)
-                        if isinstance(p, str):
+                    for locations in (value, src, value.get("image_url")):
+                        if not isinstance(locations, dict):
+                            continue
+                        for key in ATTACHMENT_PATH_FIELDS:
+                            p = locations.get(key)
+                            if not isinstance(p, str):
+                                continue
+                            if key == "url" or p.lower().startswith("file:"):
+                                p = local_file_uri_path(p)
+                                if p is None:
+                                    continue
                             f = Path(p)
                             if any(owned_file(f, root) for root in roots):
                                 output.append(Attachment(f.name, str(f)))

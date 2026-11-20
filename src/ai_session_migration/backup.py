@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import base64
-from collections import defaultdict
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing
 import hashlib
 import hmac
+from itertools import chain
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -20,7 +23,10 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 
 from .models import SessionRecord
-from .safeio import CHUNK, atomic_json, hash_file, stable_bytes, within, independent_copy, file_signature, remote_path
+from .migration_policy import forbid_client_storage
+from .portable import PORTABLE_SCHEMA, PortablePrivacyError, build_portable
+from .work_projects import configured_projects, discover_projects, project_files
+from .safeio import CHUNK, atomic_json, hash_file, stable_bytes, within, independent_copy, file_signature, owned_file, remote_path
 
 SCHEMA = "ai-session-migration-gui-1"
 MAGIC = b"ASMB1\x00"
@@ -120,7 +126,7 @@ def verify_package(archive: Path, progress=lambda *_: None, cancel=None):
             raise ValueError("数据包清单过大")
         manifest = json.loads(z.read("manifest.json"))
         schema = manifest.get("schema")
-        if schema == SCHEMA:
+        if schema in {SCHEMA, PORTABLE_SCHEMA}:
             entries = manifest.get("entries", [])
             expected = {"manifest.json", "catalog.json"}
             catalog_checksum = hashlib.sha256(z.read("catalog.json")).hexdigest()
@@ -139,23 +145,43 @@ def verify_package(archive: Path, progress=lambda *_: None, cancel=None):
             pairs = [(e["object"], e["sha256"], e["capturedSize"]) for e in entries]
         else:
             raise ValueError("数据包版本尚未支持；没有导入或改写它")
-        for index, (name, checksum, size) in enumerate(pairs):
+        for name, _, _ in pairs:
             check_cancel(cancel)
             if name in expected or not name.startswith("objects/") or len(PurePosixPath(name).parts) != 2:
                 raise ValueError("数据包对象路径无效")
             expected.add(name)
-            h, count = hashlib.sha256(), 0
-            with z.open(name) as f:
-                for block in iter(lambda: f.read(CHUNK), b""):
-                    check_cancel(cancel)
-                    count += len(block)
-                    h.update(block)
-            if h.hexdigest() != checksum or count != size:
-                raise ValueError("文件完整性校验失败：" + name)
-            if index % 20 == 0:
-                progress("逐文件校验", int((index + 1) * 100 / max(1, len(pairs))))
         if set(names) != expected:
             raise ValueError("数据包存在未登记或缺失的对象")
+
+        def verify_object(name, checksum, size):
+            check_cancel(cancel)
+            digest, count = hashlib.sha256(), 0
+            with z.open(name) as stream:
+                for block in iter(lambda: stream.read(CHUNK), b""):
+                    check_cancel(cancel)
+                    count += len(block)
+                    digest.update(block)
+            if digest.hexdigest() != checksum or count != size:
+                raise ValueError("文件完整性校验失败：" + name)
+
+        step = f"校验备份包（{len(pairs)} 个对象）"
+        if pairs:
+            progress(step, 0)
+            percent = 0
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="archive-check") as pool:
+                futures = [pool.submit(verify_object, *item) for item in pairs]
+                try:
+                    for count, future in enumerate(as_completed(futures), 1):
+                        future.result()
+                        updated = 100 * count // len(futures)
+                        if updated != percent:
+                            percent = updated
+                            progress(step, percent)
+                finally:
+                    for future in futures:
+                        future.cancel()
+        else:
+            progress(step, 100)
         return {"verified": True, "files": len(pairs), "schema": schema}
 
 
@@ -296,7 +322,120 @@ def decrypt_for_preview(archive: Path, key_path: Path, cache: Path, progress=lam
         part.unlink(missing_ok=True)
 
 
-def make_backup(library, selected: list[SessionRecord], destination: Path, key_path: Path, progress=lambda *_: None, cancel=None, annotations=None, include_projects=False):
+def planned_projects(library, selected, project_choices, include_projects, check):
+    projects = discover_projects(selected, library.home, check)
+    return configured_projects(projects, project_choices, library.home, include_projects)
+
+
+def estimate_backup(library, selected, destination, key_path, include_projects=False, project_choices=None, cancel=None):
+    """Estimate from file metadata without extracting packages or copying sources."""
+    cancel = cancel or threading.Event()
+
+    def check():
+        check_cancel(cancel)
+
+    snapshots = library.snapshots.directory
+    cache = snapshots.parent
+    destination = Path(destination).resolve()
+    registered = {record.uid for record in selected}
+    projects = {}
+    sizes = {}
+    databases = {}
+    derived = 0
+    extracts = 0
+
+    def collect(path, role, project=""):
+        check()
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return 0
+        sizes.setdefault((str(path.resolve()), project), (role, size))
+        return size
+
+    package_catalog = getattr(library, "package_catalog", None)
+    archive = getattr(library, "archive", None)
+    if package_catalog is not None:
+        for project in package_catalog.get("projects", []):
+            if registered.intersection(project.get("members", {})):
+                projects[project["id"]] = {"title": project["title"], "mode": project["mode"] if include_projects else "link", "files": 0, "bytes": 0}
+        for name, entry in library.entries.items():
+            check()
+            if entry.get("sessionUid") not in registered and not registered.intersection(entry.get("sessionUids", ())):
+                continue
+            role, size = entry["role"], entry["size"]
+            project = projects.get(entry.get("projectId"))
+            if role in {"project-work-file", "project-local-change"}:
+                if not include_projects:
+                    continue
+                if project is not None:
+                    project["files"] += 1
+                    project["bytes"] += size
+            sizes[name] = (role, size)
+            extracts += size
+    elif archive is not None:
+        extracts = collect(archive, "existing-package")
+    else:
+        for record in selected:
+            check()
+            for path, role in library.original_files(record):
+                size = collect(path, role)
+                if role in {"original-session", "claude-reading"}:
+                    derived += size
+            for name in ("state_database", "history_database"):
+                source = Path(record.metadata.get(name) or "")
+                root = Path(record.root)
+                if source in databases or not owned_file(source, root):
+                    continue
+                wal = source.with_name(source.name + "-wal")
+                try:
+                    databases[source] = source.stat().st_size + (wal.stat().st_size if owned_file(wal, root) else 0)
+                except FileNotFoundError:
+                    continue
+        history_sizes = Counter(r.metadata.get("history_database") for r in library.catalog.records if r.provider == "codex")
+        selected_histories = Counter(r.metadata.get("history_database") for r in selected if r.provider == "codex")
+        for name, count in selected_histories.items():
+            if name:
+                # Codex can contribute both viewer events and native database rows.
+                derived += 2 * databases.get(Path(name), 0) * count // max(count, history_sizes[name])
+        for project, mode, carry in planned_projects(library, selected, project_choices, include_projects, check):
+            row = {"title": project.root.name, "mode": mode, "files": 0, "bytes": 0}
+            projects[project.id] = row
+            role = "project-local-change" if mode == "git" else "project-work-file"
+            for path, _ in project_files(project, mode, carry, [destination, Path(key_path), cache], check):
+                row["bytes"] += collect(path, role, project.id)
+                row["files"] += 1
+
+    reserve = 128 * CHUNK
+    archive_metadata = 65536 + len(sizes) * 512
+    footprint = sum(size for _, size in sizes.values())
+    portable = archive_metadata + derived + sum(size for role, size in sizes.values() if role != "claude-desktop-index")
+    private = archive_metadata + derived + footprint
+    largest = max((size for _, size in sizes.values()), default=0)
+    output_temporary = archive_metadata + derived + footprint + largest
+    cache_temporary = largest + sum(databases.values()) + extracts
+
+    cache_directory = next((path for path in (cache, *cache.parents) if path.is_dir()), None)
+    output_directory = next((path for path in (destination, *destination.parents) if path.is_dir()), None)
+    if cache_directory is None or output_directory is None:
+        raise ValueError("备份位置或缓存所在磁盘不可用，请重新连接后估算")
+    same_volume = cache_directory.stat().st_dev == output_directory.stat().st_dev
+    output_free = shutil.disk_usage(output_directory).free
+    cache_free = output_free if same_volume else shutil.disk_usage(cache_directory).free
+    output_required = portable + private + output_temporary + reserve
+    cache_required = cache_temporary + reserve
+    enough = output_free >= (output_required + cache_temporary if same_volume else output_required) and (
+        same_volume or cache_free >= cache_required)
+    return {"portableBytes": portable, "encryptedBytes": private, "outputTemporaryBytes": output_temporary,
+            "cacheTemporaryBytes": cache_temporary, "outputRequired": output_required,
+            "cacheRequired": cache_required, "outputFree": output_free, "cacheFree": cache_free,
+            "sameVolume": same_volume, "cache": str(cache), "enough": enough,
+            "projects": list(projects.values())}
+
+
+def make_backup(library, selected: list[SessionRecord], destination: Path, key_path: Path, progress=lambda *_: None,
+                cancel=None, annotations=None, include_projects=False, *, project_choices=None, model=None,
+                generation_cancel=None):
     cancel = cancel or threading.Event()
     if not selected:
         raise ValueError("请先选择会话")
@@ -319,11 +458,14 @@ def make_backup(library, selected: list[SessionRecord], destination: Path, key_p
     atomic_json(report_path, report)
     entries, catalog = [], {"schema": SCHEMA, "records": [r.to_dict() for r in selected], "histories": {}, "registries": library.selected_registry(selected), "annotations": annotations or {}, "viewerOnly": True}
     portable = output / ("Windows-会话迁移包-" + run_id + ".zip")
-    part = output / ".归档处理中.zip.part"
+    private_work = tempfile.TemporaryDirectory(prefix=".会话快照-", dir=output)
+    part = Path(private_work.name) / "original.zip"
+    portable_part = output / ".迁移副本.zip.part"
     stage = output / ".当前文件.tmp"
-    sources, seen, asset_info = [], set(), {}
+    sources, seen, asset_info, project_assets = [], set(), {}, {}
     try:
         progress("取得历史数据库副本", 0)
+        capture_started = time.time()
         library = library.for_backup(selected, include_projects)
         with zipfile.ZipFile(part, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=3, allowZip64=True) as z:
             for index, record in enumerate(selected):
@@ -350,15 +492,18 @@ def make_backup(library, selected: list[SessionRecord], destination: Path, key_p
                 if "格式" in record.issue:
                     report["warnings"].append(record.title + "：格式兼容未验证，保留原始记录")
                 catalog["histories"][record.uid] = object_name
-                if record.provider == "codex" and not record.metadata.get("preview_only"):
-                    native_name = "objects/" + str(len(entries)).zfill(8)
-                    native_hash, native_size = hashlib.sha256(), 0
-                    with z.open(native_name, "w", force_zip64=True) as target:
-                        for row in library.native_database_rows(record):
-                            check_cancel(cancel)
-                            raw = (_json(row) + "\n").encode()
-                            target.write(raw); native_hash.update(raw); native_size += len(raw)
-                    entries.append({"object": native_name, "sha256": native_hash.hexdigest(), "size": native_size, "role": "native-database-rows", "logicalName": "codex-native-rows.jsonl", "sessionUid": record.uid})
+                if record.provider == "codex":
+                    with closing(library.native_database_rows(record)) as rows:
+                        first = next(rows, None)
+                        if first is not None:
+                            native_name = "objects/" + str(len(entries)).zfill(8)
+                            native_hash, native_size = hashlib.sha256(), 0
+                            with z.open(native_name, "w", force_zip64=True) as target:
+                                for row in chain((first,), rows):
+                                    check_cancel(cancel)
+                                    raw = (_json(row) + "\n").encode()
+                                    target.write(raw); native_hash.update(raw); native_size += len(raw)
+                            entries.append({"object": native_name, "sha256": native_hash.hexdigest(), "size": native_size, "role": "native-database-rows", "logicalName": "codex-native-rows.jsonl", "sessionUid": record.uid})
                 sources.extend((p, role, record.uid) for p, role in library.original_files(record))
                 for attachment in attachments:
                     if attachment.path and Path(attachment.path).is_file():
@@ -367,37 +512,44 @@ def make_backup(library, selected: list[SessionRecord], destination: Path, key_p
                     elif attachment.note:
                         report["warnings"].append(attachment.name + "：" + attachment.note)
             owners = defaultdict(set)
-            if include_projects:
-                skip_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__", ".next", ".nuxt", ".turbo", ".pytest_cache"}
-                for record in selected:
-                    if record.metadata.get("preview_only"):
-                        report["warnings"].append("数据包预览中的项目原路径不会自动读取，请在本机来源中另行关联")
-                        continue
-                    project = Path(record.cwd) if record.cwd else None
-                    if project is None or remote_path(project) or not project.is_absolute() or not project.is_dir():
-                        report["warnings"].append(record.title + "：项目目录缺失，未纳入工作文件")
-                        continue
-                    project = project.resolve()
-                    if project == library.home or len(project.parts) < 5:
-                        report["warnings"].append(record.title + "：工作目录过于宽泛，未自动收集项目文件")
-                        continue
-                    progress("统计关联项目工作文件", 0)
-                    for base, dirs, files in os.walk(project, followlinks=False):
-                        check_cancel(cancel)
-                        dirs[:] = [d for d in dirs if d not in skip_dirs and not (Path(base) / d).is_symlink() and not within(Path(base) / d, destination) and not within(Path(base) / d, library.snapshots.directory.parent)]
-                        for filename in files:
-                            p = Path(base) / filename
-                            if p.is_symlink() or p.resolve() == key_path or filename.startswith((".env", ".credentials")) or p.suffix.lower() in {".key", ".asmkey", ".pem", ".p12", ".pfx", ".keystore"} or filename in {"auth.json", "credentials.json"}:
-                                continue
-                            sources.append((p, "project-work-file", record.uid))
-            for p, _, uid in sources:
-                owners[str(p.resolve())].add(uid)
+            project_data = []
+            if getattr(library, "package_catalog", None):
+                for previous in library.package_catalog.get("projects", []):
+                    members = {uid: sub for uid, sub in previous["members"].items() if uid in {r.uid for r in selected}}
+                    if members:
+                        project_data.append(dict(previous, members=members) if include_projects else
+                                            dict(previous, members=members, mode="link", git={}, changes={}))
+            else:
+                progress("统计关联项目工作文件", 0)
+                for project, mode, carry in planned_projects(library, selected, project_choices, include_projects, lambda: check_cancel(cancel)):
+                    project_data.append(project.manifest(mode, carry))
+                    role = "project-local-change" if mode == "git" else "project-work-file"
+                    for p, relative in project_files(project, mode, carry,
+                                                    [destination, key_path, library.snapshots.directory.parent],
+                                                    lambda: check_cancel(cancel)):
+                        for uid in project.members:
+                            project_assets[str(p.resolve()), uid] = {"projectId": project.id, "projectPath": relative}
+                            sources.append((p, role, uid))
+            catalog["projects"] = project_data
+            by_uid = {item["uid"]: item for item in catalog["records"]}
+            for entry in project_data:
+                for uid, relative in entry["members"].items():
+                    by_uid[uid]["metadata"].update(project_ref=entry["id"], project_relative=relative,
+                                                   project_title=entry["title"])
+            def item_identity(p, role, uid):
+                path = str(p.resolve())
+                extra = project_assets.get((path, uid), {}) if role in {"project-work-file", "project-local-change"} else {}
+                return (path, extra.get("projectId", "")), extra
+
+            for p, role, uid in sources:
+                identity, _ = item_identity(p, role, uid)
+                owners[identity].add(uid)
             estimated = sum({str(p.resolve()): p.stat().st_size for p, _, _ in sources if p.exists()}.values())
-            if shutil.disk_usage(output).free < estimated * 2 + 128 * CHUNK:
+            if shutil.disk_usage(output).free < estimated * 3 + part.stat().st_size * 2 + 128 * CHUNK:
                 raise ValueError("备份位置空间不足，请选择空间充足的位置")
             for index, (p, role, uid) in enumerate(sources):
                 check_cancel(cancel)
-                identity = str(p.resolve())
+                identity, project_info = item_identity(p, role, uid)
                 if identity in seen:
                     continue
                 seen.add(identity)
@@ -409,13 +561,30 @@ def make_backup(library, selected: list[SessionRecord], destination: Path, key_p
                     continue
                 name = "objects/" + str(len(entries)).zfill(8)
                 z.write(stage, name)
-                entries.append({"object": name, **meta, "originalPath": str(p), "role": role, "sessionUid": uid, "sessionUids": sorted(owners[identity]), **library.origin_metadata(p), **asset_info.get(identity, {})})
+                entries.append({"object": name, **meta, "originalPath": str(p), "role": role, "sessionUid": uid, "sessionUids": sorted(owners[identity]), **library.origin_metadata(p), **asset_info.get(identity[0], {}), **project_info})
+                if role == "claude-reading" and hasattr(library, "draft"):
+                    record = next(r for r in selected if r.uid == uid)
+                    entries[-1]["readingNumber"] = record.session_id
+                    prompt = library.draft(record, meta["sha256"])
+                    if prompt:
+                        data = prompt.encode("utf-8")
+                        draft_name = "objects/" + str(len(entries)).zfill(8)
+                        z.writestr(draft_name, data)
+                        entries.append({"object": draft_name, "role": "handoff-draft", "sessionUid": uid,
+                                        "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                                        "sourceSha256": meta["sha256"], "readingNumber": record.session_id})
                 stage.unlink(missing_ok=True)
             raw_catalog = _json(catalog).encode()
             z.writestr("catalog.json", raw_catalog)
-            manifest = {"schema": SCHEMA, "entries": entries, "catalogSha256": hashlib.sha256(raw_catalog).hexdigest(), "snapshotMode": report["snapshotMode"], "sourceDataModified": False, "thinkingTransform": False, "projectWorkFilesIncluded": include_projects, "projectExclusions": ["Git 元数据", "依赖缓存", "独立凭据和密钥", "备份与本工具缓存位置"], "warnings": list(dict.fromkeys(report["warnings"])), "windowsImported": False, "modelVerified": False}
+            manifest = {"schema": SCHEMA, "purpose": "private-preservation", "entries": entries, "catalogSha256": hashlib.sha256(raw_catalog).hexdigest(), "snapshotMode": report["snapshotMode"], "sourceDataModified": False, "thinkingTransform": False, "projectWorkFilesIncluded": include_projects, "projectExclusions": ["Git 元数据", "依赖缓存", "独立凭据和密钥", "备份与本工具缓存位置"], "warnings": list(dict.fromkeys(report["warnings"])), "windowsImported": False, "modelVerified": False}
+            report["snapshotWindow"] = {"startedAt": capture_started, "finishedAt": time.time(),
+                                        "selectedSessions": len(selected), "projectCount": len(project_data),
+                                        "nativeDatabaseObjects": sum(e["role"] == "native-database-rows" for e in entries)}
+            manifest["snapshotWindow"] = report["snapshotWindow"]
             z.writestr("manifest.json", _json(manifest))
-        report.update(archiveReady=True, pendingArchive=str(part), files=len(entries), originalFiles=len(seen))
+        if report["warnings"]:
+            report["warnings"] = [f"采集时有 {len(manifest['warnings'])} 项需要关注，明细保存在加密保全清单中。"]
+        report.update(files=len(entries), originalFiles=len(seen))
         atomic_json(report_path, report)
         report["archiveCheck"] = verify_package(part, progress, cancel)
         check_cancel(cancel)
@@ -424,21 +593,97 @@ def make_backup(library, selected: list[SessionRecord], destination: Path, key_p
         verify_encrypted(encrypted_part, key_path, plain_sha, progress, cancel)
         encrypted = output / ("Mac-会话保全备份-" + run_id + ".asmb")
         os.rename(encrypted_part, encrypted)
-        os.rename(part, portable)
+        report.update(encrypted=str(encrypted), encryptedReadbackVerified=True, plainSha256=plain_sha)
+        report["privacyCheck"] = build_portable(part, portable_part, lambda: check_cancel(cancel), progress, model=model,
+                                                generation_cancel=generation_cancel)
+        report["portableCheck"] = verify_package(portable_part, progress, cancel)
+        os.rename(portable_part, portable)
         with portable.open("r+b") as f:
             os.fsync(f.fileno())
         report.update(status="complete-with-warnings" if report["warnings"] else "complete", finishedAt=time.time(), files=len(entries), originalFiles=len(seen), encryptedReadbackVerified=True, portable=str(portable), encrypted=str(encrypted), plainSha256=plain_sha, bytes=portable.stat().st_size, warnings=list(dict.fromkeys(report["warnings"])))
-        atomic_json(output / "文件清单.json", manifest)
+        with zipfile.ZipFile(portable) as bundle:
+            atomic_json(output / "文件清单.json", json.loads(bundle.read("manifest.json")))
+            readings = json.loads(bundle.read("catalog.json")).get("readings", {})
+            report["handoff"] = dict(Counter(e["status"] for e in readings.values()))
         atomic_json(report_path, report)
         progress("备份与回读完成", 100)
         return report
     except BaseException as error:
+        if isinstance(error, PortablePrivacyError):
+            report["privacyCheck"] = {"verified": False, "findings": error.findings}
         report.update(status="cancelled" if isinstance(error, Cancelled) else "failed", error=type(error).__name__ + "：" + str(error), finishedAt=time.time())
         atomic_json(report_path, report)
         error.report = report
         raise
     finally:
         stage.unlink(missing_ok=True)
+        portable_part.unlink(missing_ok=True)
+        (output / ".加密备份处理中.asmb.part").unlink(missing_ok=True)
+        private_work.cleanup()
+
+
+def rebuild_portable(report, key_path, exclusions, progress=lambda *_: None, cancel=None):
+    """Recheck the original encrypted snapshot and publish only a new migration ZIP."""
+    if not report.get("encryptedReadbackVerified") or not report.get("encrypted") or not report.get("plainSha256"):
+        raise ValueError("重新导出需要这次任务已校验的原样加密保全")
+    preserved = Path(report.get("preservationDirectory") or report["output"]).resolve()
+    encrypted = Path(report["encrypted"])
+    if encrypted.is_symlink() or not encrypted.is_file() or encrypted.resolve().parent != preserved:
+        raise ValueError("原样加密保全的位置已变化，请先从备份库打开该文件")
+    forbid_client_storage(preserved)
+    previous = report.get("privacyExclusions") or {}
+    excluded = {kind: sorted(set(exclusions.get(kind, ())) | set(previous.get(kind, ())))
+                for kind in ("sessions", "objects", "projects")}
+    if not any(excluded.values()):
+        raise ValueError("请先选择要排除的会话或项目资料")
+    cancel = cancel or threading.Event()
+    def check():
+        check_cancel(cancel)
+
+    def decrypt_progress(stage, percent):
+        check()
+        progress(stage, percent)
+
+    read_key(Path(key_path))
+    serial = uuid.uuid4().hex[:8]
+    output = preserved.parent / ("迁移重建-" + serial)
+    output.mkdir(mode=0o700)
+    updated = {key: value for key, value in report.items() if key not in {"portable", "portableCheck", "privacyCheck", "handoff", "error", "bytes"}}
+    updated.update(output=str(output), preservationDirectory=str(preserved), keyPath=str(key_path),
+                   startedAt=time.time(), privacyExclusions=excluded, status="rebuilding")
+    archive = output / ("Windows-会话迁移包-" + serial + ".zip")
+    part = archive.with_suffix(".zip.part")
+    try:
+        with tempfile.TemporaryDirectory(prefix=".snapshot-", dir=output) as temp:
+            captured = decrypt_for_preview(encrypted, Path(key_path), Path(temp), decrypt_progress)
+            check()
+            if hash_file(captured) != report["plainSha256"]:
+                raise ValueError("解密后的原样保全与该任务的校验记录不一致")
+            updated["privacyCheck"] = build_portable(captured, part, check, progress, excluded=excluded)
+            updated["portableCheck"] = verify_package(part, progress, cancel)
+        with zipfile.ZipFile(part) as bundle:
+            manifest = json.loads(bundle.read("manifest.json"))
+            catalog = json.loads(bundle.read("catalog.json"))
+        check()
+        with part.open("r+b") as stream:
+            os.fsync(stream.fileno())
+        atomic_json(output / "文件清单.json", manifest)
+        os.rename(part, archive)
+        updated.update(status="complete-with-warnings" if updated.get("warnings") else "complete",
+                       portable=str(archive), bytes=archive.stat().st_size, sessions=len(catalog["records"]),
+                       files=len(manifest["entries"]), finishedAt=time.time(),
+                       handoff=dict(Counter(e["status"] for e in catalog.get("readings", {}).values())))
+        atomic_json(output / "结果.json", updated)
+        return updated
+    except Exception as error:
+        if isinstance(error, PortablePrivacyError):
+            updated["privacyCheck"] = {"verified": False, "findings": error.findings}
+        updated.update(status="cancelled" if isinstance(error, Cancelled) else "failed", error=str(error), finishedAt=time.time())
+        atomic_json(output / "结果.json", updated)
+        error.report = updated
+        raise
+    finally:
+        part.unlink(missing_ok=True)
 
 
 def resume_backup(report: dict, key_path: Path, progress=lambda *_: None, cancel=None, protected_roots=()):
@@ -464,7 +709,14 @@ def resume_backup(report: dict, key_path: Path, progress=lambda *_: None, cancel
         encrypted = output / ("Mac-会话保全备份-恢复-" + suffix + ".asmb")
         portable = output / ("Windows-会话迁移包-恢复-" + suffix + ".zip")
         os.rename(encrypted_part, encrypted)
-        os.rename(archive, portable)
+        portable_part = output / (".迁移副本-" + suffix + ".part")
+        try:
+            updated["privacyCheck"] = build_portable(archive, portable_part, lambda: check_cancel(cancel), progress)
+            updated["portableCheck"] = verify_package(portable_part, progress, cancel)
+            os.rename(portable_part, portable)
+        finally:
+            portable_part.unlink(missing_ok=True)
+        archive.unlink()
         updated.update(status="complete-with-warnings" if updated.get("warnings") else "complete", finishedAt=time.time(), portable=str(portable), encrypted=str(encrypted), encryptedReadbackVerified=True, plainSha256=plain_sha, bytes=portable.stat().st_size, keyPath=str(key_path), error=None)
         with zipfile.ZipFile(portable) as package:
             atomic_json(output / "文件清单.json", json.loads(package.read("manifest.json")))

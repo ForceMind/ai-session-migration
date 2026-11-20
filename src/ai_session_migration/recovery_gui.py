@@ -110,7 +110,8 @@ class RecoveryCenter(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 18)
         heading = QHBoxLayout()
-        heading.addWidget(text_label("恢复中心", "Heading"), 1)
+        heading.addWidget(text_label("从备份目录恢复", "Heading"), 1)
+        heading.addWidget(action("直接打开迁移 ZIP…", self.owner.choose_restore_package))
         self.cache_button = action("缓存设置…", self.cache_settings)
         heading.addWidget(self.cache_button)
         layout.addLayout(heading)
@@ -151,7 +152,7 @@ class RecoveryCenter(QWidget):
         self.group_list.itemChanged.connect(self.group_checked)
         ll.addWidget(self.group_list, 1)
         self.index_button = action("索引当前组", self.index_group)
-        self.native_button = action("打开原生会话选择…", self.open_native)
+        self.native_button = action("打开该批次的迁移包…", self.open_native, True)
         ll.addWidget(self.index_button); ll.addWidget(self.native_button)
         split.addWidget(left)
         middle = QWidget(); ml = QVBoxLayout(middle); ml.setContentsMargins(0, 0, 0, 0)
@@ -289,7 +290,8 @@ class RecoveryCenter(QWidget):
         self.next.setEnabled(idle and self.offset + self.PAGE_SIZE < self.total)
         self.preview_button.setEnabled(idle and bool(self.catalog) and self.source_matches() and bool(self.selected_items or self.selected_groups))
         self.ack.setEnabled(idle and bool(self.plan))
-        self.restore_button.setEnabled(idle and bool(self.plan) and self.ack.isChecked() and bool(self.plan.get("new")))
+        self.restore_button.setEnabled(idle and bool(self.plan) and self.ack.isChecked() and bool(self.plan.get("new"))
+                                       and self.plan.get("space", {}).get("enough", True))
         self.plan_previous.setEnabled(idle and bool(self.plan) and self.plan_offset > 0)
         self.plan_next.setEnabled(idle and bool(self.plan) and self.plan_offset + self.PAGE_SIZE < int((self.plan or {}).get("selected", 0)))
         for widget in (self.check_record_button, self.open_record_button, self.rollback_button):
@@ -318,6 +320,7 @@ class RecoveryCenter(QWidget):
     def choose_root(self):
         path = QFileDialog.getExistingDirectory(self, "选择迁移备份目录", self.root_field.text())
         if path:
+            self.tabs.setCurrentIndex(0)
             self.root_field.setText(path); self.load_root()
 
     def load_root(self):
@@ -345,7 +348,13 @@ class RecoveryCenter(QWidget):
             self.clear_selected(); self.current_group = None
             self.items.clear(); self.total = self.offset = 0
             self.fill_groups()
-            self.stage.setText(f"已识别 {len(self.groups)} 组备份" if self.groups else "目录内没有可识别备份；源文件保持不变。")
+            native_batch = next((self.group_list.item(i) for i in range(self.group_list.count())
+                                 if self.group_list.item(i).data(Qt.ItemDataRole.UserRole).get("native_archive")), None)
+            if native_batch:
+                self.group_list.setCurrentItem(native_batch)
+                self.stage.setText("选择备份批次，再点击「打开该批次的迁移包」。")
+            else:
+                self.stage.setText(f"已识别 {len(self.groups)} 组备份" if self.groups else "目录内没有可识别备份，请重新选择目录。")
         self.run_task(work, done, "正在发现备份分类")
 
     def choose_keys(self):
@@ -507,9 +516,13 @@ class RecoveryCenter(QWidget):
                         raise ValueError(f"{group.get('label', '')}：{STATUSES.get(group.get('status'), group.get('status'))}；{group.get('detail', '')}")
             return build_file_plan(self.catalog, items, groups, target, backup, progress=progress, cancel=self.cancel)
         def done(plan):
+            from .gui import file_restore_space_text
             self.plan = plan; self.plan_offset = 0; self.ack.setChecked(False)
             self.groups = self.catalog.groups(); self.fill_groups()
-            self.summary.setText(f"目标：{plan['target']}\n目标备份：{plan['backupRoot']}\n新增 {plan['new']} · 跳过 {plan['skip']} · 阻止 {plan['blocked']} · {size_text(plan.get('bytes'))}\n已有文件不覆盖；阻止项不会写入。Mac 应用资料仅导出副本。")
+            space_text = file_restore_space_text(plan.get('space'))
+            self.summary.setText(f"目标：{plan['target']}\n目标备份：{plan['backupRoot']}\n新增 {plan['new']} · 跳过 {plan['skip']} · 阻止 {plan['blocked']} · {size_text(plan.get('bytes'))}\n"
+                                 + (space_text + "\n" if space_text else "")
+                                 + "同名文件将保留目标版本。Mac 应用资料按文件副本提取。")
             self.tabs.setCurrentIndex(1); self.load_plan_page()
         self.run_task(work, done, "正在生成冲突与路径安全预览")
 
@@ -536,6 +549,9 @@ class RecoveryCenter(QWidget):
         if not self.plan or not self.ack.isChecked() or not self.plan.get("new"):
             self.show_error("请先生成预览并确认明文目标备份的隐私提示。")
             return
+        if not self.plan.get("space", {}).get("enough", True):
+            self.show_error("空间不足，请更改位置后重新预览。")
+            return
         from .file_restore import execute_file_restore
         plan = self.plan
         self.ack.setChecked(False)
@@ -549,9 +565,13 @@ class RecoveryCenter(QWidget):
         records.insert(0, report)
         self.owner.state.save()
         self.plan = None; self.ack.setChecked(False)
-        self.refresh_records(); self.tabs.setCurrentIndex(2)
+        self.show_records()
         self.log.appendPlainText(f"状态：{status_text(report.get('status'))}；已恢复 {report.get('restored', 0)}；跳过 {report.get('skipped', 0)}；阻止 {report.get('blocked', 0)}")
         self.stage.setText("恢复记录已保存 · 请核对目标备份、回读验证和结果状态")
+
+    def show_records(self):
+        self.refresh_records()
+        self.tabs.setCurrentIndex(2)
 
     def refresh_records(self):
         self.record_list.clear()
@@ -639,4 +659,4 @@ class RecoveryCenter(QWidget):
         if not Path(path).is_file():
             self.show_error("原生会话包不可访问，请连接对应磁盘。")
             return
-        self.owner.open_package_path(path)
+        self.owner.open_package_path(path, route="restore")

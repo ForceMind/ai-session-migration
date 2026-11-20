@@ -130,7 +130,9 @@ class RecoveryGuiTest(unittest.TestCase):
         def build(catalog, item_ids, group_ids, target, backup, **kwargs):
             calls.append(('build', item_ids, group_ids))
             return dict(id='plan', target=str(target), backupRoot=str(backup), new=1, skip=1,
-                blocked=1, bytes=10, selected=3, database='fixture.sqlite')
+                blocked=1, bytes=10, selected=3, database='fixture.sqlite',
+                space=dict(sameVolume=True, enough=True, targetBytes=10, backupBytes=20,
+                           reserveBytes=100, targetAvailable=500, backupAvailable=500))
         def rows(plan, offset=0, limit=200):
             return [dict(id=str(i), path=f'file-{i}', destination=f'target/file-{i}', status=status,
                 reason='fixture reason', size=10) for i, status in enumerate(['new', 'skip', 'blocked'])]
@@ -146,6 +148,7 @@ class RecoveryGuiTest(unittest.TestCase):
         with patch.dict('sys.modules', {'ai_session_migration.file_restore': api}):
             self.page.preview(); self.wait_tasks()
             self.assertEqual(self.page.plan_list.count(), 3)
+            self.assertIn('同盘约需 130 B', self.page.summary.text())
             self.assertFalse(self.page.restore_button.isEnabled())
             self.page.restore()
             self.assertEqual(len(calls), 1)
@@ -369,7 +372,7 @@ class RecoveryGuiTest(unittest.TestCase):
         package = self.base / 'portable.zip'; package.write_bytes(b'fixture')
         self.page.current_group = dict(id='sessions', native_archive=str(package))
         with patch.object(self.owner, 'open_package_path') as open_package:
-            self.page.open_native(); open_package.assert_called_once_with(str(package))
+            self.page.open_native(); open_package.assert_called_once_with(str(package), route="restore")
         package.unlink(); self.page.open_native()
         self.assertIn('不可访问', self.page.stage.text())
 

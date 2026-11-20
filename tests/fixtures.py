@@ -65,6 +65,13 @@ def make_home(home: Path):
     return {"claude": c, "deepseek": session / "session.v4.jsonl.zstd", "project": project}
 
 
+def make_acceptance_home(home: Path):
+    files = make_home(home)
+    (files['project'] / 'selected.txt').write_bytes(b'synthetic work file')
+    (files['project'] / 'existing.txt').write_bytes(b'synthetic source version')
+    return files
+
+
 def make_import_target(home: Path):
     files = make_home(home)
     files['claude'].rename(files['claude'].with_name('existing-claude.jsonl'))

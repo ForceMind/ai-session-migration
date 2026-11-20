@@ -5,6 +5,7 @@ from contextlib import contextmanager, closing
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -168,6 +169,15 @@ class FileRestoreTests(unittest.TestCase):
         with patch('ai_session_migration.file_restore.Path.home', return_value=fake_home):
             for name in ('.claude', '.codex', '.dsh', 'Library/Application Support/Claude', 'Library/Application Support/Codex'):
                 with self.subTest(name=name), self.assertRaisesRegex(ValueError, '原生会话'): self.plan([item], target=fake_home / name / 'data')
+        for variable in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'DSH_HOME'):
+            live = self.base / variable
+            target = live / 'data'
+            with self.subTest(variable=variable), patch.dict(os.environ, {variable: str(live)}):
+                with self.assertRaisesRegex(ValueError, '原生会话'):
+                    self.plan([item], target=target)
+                with self.assertRaisesRegex(ValueError, '原生会话'):
+                    self.plan([item], backup=target)
+            self.assertFalse(live.exists())
         with self.assertRaises(ValueError): self.plan([item], target=Path('//server/share/target'))
 
     def test_low_space_rejected_before_target_or_backup_writes(self):
@@ -175,6 +185,22 @@ class FileRestoreTests(unittest.TestCase):
         with patch.object(restore, '_parent_space', return_value=(0, 1)):
             with self.assertRaisesRegex(ValueError, '空间不足'): restore.execute_file_restore(self.catalog, plan)
         self.assertFalse(self.target.exists()); self.assertFalse(self.backup.exists())
+
+    def test_file_preview_combines_new_files_and_backup_when_they_share_a_disk(self):
+        item = self.catalog.add('new.txt', b'new data')
+        self.target.mkdir()
+        (self.target/'present.txt').write_bytes(b'target file')
+        plan = self.plan([item])
+        space = plan['space']
+        self.assertTrue(space['sameVolume'])
+        self.assertEqual(space['backupBytes'], len(b'target file'))
+        self.assertEqual(space['targetBytes'], len(b'new data') + 4096)
+        available = space['targetBytes'] + space['reserveBytes']
+        with patch.object(restore, '_parent_space', return_value=(available, 1)):
+            preview = self.plan([item])
+        self.assertFalse(preview['space']['enough'])
+        self.assertFalse(self.backup.exists())
+        self.assertFalse((self.target/'new.txt').exists())
 
     def test_cancel_after_first_publication_check_and_safe_rollback(self):
         a = self.catalog.add('a.txt', b'a'); b = self.catalog.add('b.txt', b'b')

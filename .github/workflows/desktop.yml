@@ -46,9 +46,9 @@ jobs:
         shell: pwsh
         run: |
           $env:PYTHONPATH = 'tests'
-          python -c "from pathlib import Path; from fixtures import make_home, make_import_target; make_home(Path('build/smoke-home').resolve()); make_import_target(Path('build/smoke-state/synthetic-import-target').resolve())"
+          python -c "from pathlib import Path; from fixtures import make_acceptance_home, make_import_target; make_acceptance_home(Path('build/h').resolve()); make_import_target(Path('build/s/synthetic-import-target').resolve())"
           $client = Join-Path $PWD 'release/AI Session Migration/AI Session Migration.exe'
-          $arguments = @('--smoke-home', (Join-Path $PWD 'build/smoke-home'), '--smoke-state', (Join-Path $PWD 'build/smoke-state'), '--smoke-report', (Join-Path $PWD 'build/packaged-smoke.json'), '--smoke-import', '--smoke-recovery')
+          $arguments = @('--smoke-home', (Join-Path $PWD 'build/h'), '--smoke-state', (Join-Path $PWD 'build/s'), '--smoke-report', (Join-Path $PWD 'build/packaged-smoke.json'), '--smoke-import', '--smoke-recovery')
           $process = Start-Process -FilePath $client -ArgumentList ($arguments | ForEach-Object { '"' + $_ + '"' }) -PassThru -Wait
           if ($process.ExitCode -ne 0) { throw "Packaged client failed: $($process.ExitCode)" }
           $result = Get-Content build/packaged-smoke.json -Raw | ConvertFrom-Json
@@ -56,7 +56,7 @@ jobs:
       - name: Upload standalone Windows client
         uses: actions/upload-artifact@v4
         with:
-          name: AI-Session-Migration-0.3.0-Windows-x64
+          name: AI-Session-Migration-Windows-x64
           path: release/AI Session Migration/
           retention-days: 14
       - name: Upload synthetic acceptance report
@@ -64,4 +64,27 @@ jobs:
         with:
           name: Windows-synthetic-acceptance
           path: build/packaged-smoke.json
+          retention-days: 14
+  macos-build:
+    runs-on: macos-15
+    env:
+      PYTHONPATH: src
+      PYTHONUTF8: '1'
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements-build.txt
+      - name: Build and verify the mounted disk image
+        run: python tools/build_macos_release.py --dist release --work build/macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AI-Session-Migration-macOS
+          path: |
+            release/AI-Session-Migration-macOS.dmg
+            release/macOS-SHA256.txt
+            release/packaged-smoke.json
           retention-days: 14
