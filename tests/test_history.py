@@ -26,7 +26,8 @@ def source_fixture(base):
 class HistoryTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.base = Path(self.temp.name)
+        # CI temp directories can be aliases, while the reader checks canonical paths.
+        self.base = Path(self.temp.name).resolve()
         self.root, self.prepared = source_fixture(self.base)
 
     def tearDown(self):
