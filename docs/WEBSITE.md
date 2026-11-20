@@ -17,3 +17,9 @@ Cloudflare Pages 项目为 `ai-session-migration`，生产分支 `main`。仅上
 2026-11-06：本轮同步0.3.0主分支和预览版下载，官网新增恢复中心、选择文件/目录/整组、目标备份、分页、缓存和副本/原生恢复边界。保留合成示意标签及真实Windows待验证说明。仅部署site目录，浏览器未验证。部署完成后独立核对生产资源字节、响应头和四个版本下载入口。
 
 0.3.0 本轮已上线并独立回读：生产部署 `f5afca75-848c-4536-81a7-8c4bef0db919`，部署地址 https://f5afca75.ai-session-migration.pages.dev ，生产分支main，资源提交 `f0b42acc61ba44f7263a5ac7e9dfc970ea7efedd`。7个生产资源与本地字节一致，安全响应头通过，4个公开下载入口HTTP可用且资产服务端摘要与已验收文件一致；通用说明及校验清单已实际下载逐字节比对。主分支[集成CI](https://github.com/ForceMind/ai-session-migration/actions/runs/42216621333)通过；应用源码与已验收构建8aecbd0一致，未重新编译或替换发布安装包。浏览器未验证。
+
+## 0.4.3 生产记录
+
+2026-11-20，Cloudflare Pages 的 `main` 已部署提交 `5fc36f3330100bcb36a555dd93c263906ff10999`，部署 ID 为 `cbc875a6-9556-4639-812b-c0c2b9cd618f`。从正式域名回读的七个资源与本地逐字节一致，五个安全响应头通过检查。部署保留原生产站的恢复指南布局与备用下载入口。[生产版本](https://cbc875a6.ai-session-migration.pages.dev)
+
+GitHub `v0.4.3` 标签指向 `52795208704a219d7821a7542a7ff26cfea93c02`。Windows ZIP 的服务端 SHA-256 与本地已验收包一致，公开校验文件实际下载一致。Windows 官方和备用下载入口、保留的 macOS 0.3.0 下载入口均返回 HTTP 200。浏览器未验证。[Windows 预览版](https://github.com/ForceMind/ai-session-migration/releases/tag/v0.4.3)
